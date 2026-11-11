@@ -167,7 +167,7 @@
         ? S.undoStep(cur, stepId, { by: state.user })
         : S.markStep(cur, stepId, { date, by: state.user, note, pour: o.group && o.group.numbered ? o.group.key : (o.group && o.group.label) || "", key: o.key });
       try {
-        await state.client.write(state.lib.id, state.defId, S.entityLink(o.guid), next);
+        await (undo ? state.client.replace : state.client.write).call(state.client, state.lib.id, state.defId, S.entityLink(o.guid), next);
         state.records.set(o.guid, next);
         done++;
       } catch (e) {

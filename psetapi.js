@@ -13,6 +13,10 @@
   };
   const hostFor = (svc, region) => (region === "master" ? `https://${svc}-api.connect.trimble.com/v1/` : `https://${svc}-api.${region}.connect.trimble.com/v1/`);
 
+  const psetPath = (link, libId, defId) => `psets/${encodeURIComponent(link)}/${encodeURIComponent(libId)}/${encodeURIComponent(defId)}`;
+  /** Drop empty values: the service has no "empty" for typed fields; leaving a field out means "no value". */
+  const clean = (props) => Object.fromEntries(Object.entries(props || {}).filter(([, v]) => v !== null && v !== undefined && v !== ""));
+
   class ApiError extends Error {
     constructor(status, message, body) { super(message); this.status = status; this.body = body; }
   }
@@ -102,13 +106,28 @@
       return out;
     }
 
-    /** Write (create or update) the status of one object. */
+    /** Write (create or update) the status of one object. PATCH merges: fields left out keep their value. */
     write(libId, defId, link, props) {
-      return this.request("pset", `psets/${encodeURIComponent(link)}/${encodeURIComponent(libId)}/${encodeURIComponent(defId)}`, "PATCH", { props });
+      return this.request("pset", psetPath(link, libId, defId), "PATCH", { props: clean(props) });
+    }
+
+    /** Replace the whole status of one object, so fields can be cleared (pset-api rejects "" and null for typed
+     *  fields, and PATCH cannot remove a field). Same as Connect web: delete, then re-create; if the deleted pset
+     *  still blocks (412), re-create on top of its version. */
+    async replace(libId, defId, link, props) {
+      const path = psetPath(link, libId, defId);
+      try { await this.request("pset", path, "DELETE"); } catch (e) { if (e.status !== 404) throw e; }
+      const body = { props: clean(props) };
+      try { return await this.request("pset", path, "PATCH", body); }
+      catch (e) {
+        if (e.status !== 412 && e.status !== 409) throw e;
+        const del = await this.request("pset", path + "?deleted");
+        return this.request("pset", path, "PATCH", Object.assign(body, { v: del && del.v }));
+      }
     }
   }
 
-  const lib = { PsetClient, ApiError, hostFor };
+  const lib = { PsetClient, ApiError, hostFor, clean };
   if (typeof module === "object" && module.exports) module.exports = lib;
   else root.PsetApi = lib;
 })(typeof self !== "undefined" ? self : this);
