@@ -11,10 +11,10 @@
   const T = {
     title: ["Pour status · Статус тактове", "Pour status · Статус тактове"],
     selection: ["Избрано", "Selection"], steps: ["Етапи", "Steps"], view: ["Изглед", "View"], pours: ["Тактове", "Pours"],
-    fromViewer: ["Вземи от модела", "Use viewer selection"], clear: ["Изчисти", "Clear"],
+    fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], clear: ["Изчисти", "Clear"],
     colour: ["Оцвети по статус", "Colour by status"], orphans: ["Статус без обект", "Status without object"],
-    nothing: ["Нищо не е избрано. Изберете тактове в модела и натиснете „Вземи от модела“, или изберете такт от таблицата.",
-      "Nothing selected. Select pours in the model and click “Use viewer selection”, or pick a pour in the table."],
+    nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
+      "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
     markDone: ["Готово", "Mark done"], undo: ["Отмени", "Undo"], note: ["Бележка (по избор)", "Note (optional)"],
     done: ["готови", "done"], select: ["Избери", "Select"], pour: ["Такт", "Pour"],
   };
@@ -25,6 +25,7 @@
   const state = {
     api: null, client: null, project: null, user: "",
     lib: null, defId: S.DEF_ID, ready: false,
+    follow: (() => { try { return localStorage.getItem("arsten.pourStatus.follow") !== "0"; } catch { return true; } })(),   // follow model selection (default on)
     pours: [], loose: [], objects: [],      // pour groups; all pour objects [{modelId,id,guid,key,props,bbox,group}]
     byKey: new Map(),                        // "modelId:id" -> pour object
     records: new Map(),                      // guid -> status props
@@ -129,12 +130,16 @@
   }
 
   // ---------- selection ----------
-  async function selectionFromViewer() {
+  /** Take the viewer's selection into the panel. quiet: called by "follow model selection" (empty selection just clears). */
+  async function selectionFromViewer(quiet) {
     const sel = (await state.api.viewer.getSelection()) || [];
     const picked = [];
     let n = 0;
     for (const m of sel) for (const id of m.objectRuntimeIds || []) { n++; const o = state.byKey.get(m.modelId + ":" + id); if (o) picked.push(o); }
-    if (!n) return setStatus(t("nothing"), true);
+    if (!n) {
+      if (quiet === true) { state.sel = []; setStatus(""); return render(); }
+      return setStatus(t("nothing"), true);
+    }
     if (!picked.length) return setStatus(`${n} ${lang === "bg" ? "избрани обекта, но нито един не е такт." : "objects selected, none of them is a pour object."}`, true);
     state.sel = picked;
     setStatus("");
@@ -206,6 +211,7 @@
     $("hSel").textContent = t("selection"); $("hSteps").textContent = t("steps"); $("hView").textContent = t("view");
     $("hSummary").textContent = t("pours"); $("hOrphans").textContent = t("orphans");
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
+    $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
     $("lblColour").textContent = t("colour");
     if (!state.ready) return;
     // selection
@@ -283,6 +289,20 @@
     });
   });
   $("btnFromViewer").onclick = () => guarded(selectionFromViewer);
+  $("chkFollow").onchange = (e) => {
+    state.follow = e.target.checked;
+    try { localStorage.setItem("arsten.pourStatus.follow", state.follow ? "1" : "0"); } catch {}
+    render();
+    if (state.follow && state.ready) guarded(() => selectionFromViewer(true));
+  };
+  // "Follow model selection": re-read the selection shortly after it changes in the viewer (debounced: one
+  // click can fire several events).
+  let followTimer = null;
+  function onViewerSelection() {
+    if (!state.follow || !state.ready || !state.api) return;
+    clearTimeout(followTimer);
+    followTimer = setTimeout(() => guarded(() => selectionFromViewer(true)), 200);
+  }
   $("btnSelClear").onclick = () => { state.sel = []; render(); };
   $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; await applyColours(); });
   $("selLang").value = lang;
@@ -306,10 +326,11 @@
     render();
     await guarded(start2);
   }
-  window.PourStatusApp = { start, state };
+  window.PourStatusApp = { start, state, onEvent: (e, d) => onEvent(e, d) };
 
   function onEvent(event, data) {
     if (event === "extension.accessToken") onToken(data);
+    if (event === "viewer.onSelectionChanged") onViewerSelection();
     if (event === "viewer.onModelStateChanged" && state.api) { state.objects = []; state.sel = []; guarded(start2); }
   }
   if (window.parent === window) {
