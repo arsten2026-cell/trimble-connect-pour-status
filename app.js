@@ -212,12 +212,20 @@
 
   // ---------- CSV export ----------
   /** One row per pour object (sorted by pour number, then type), with every step's date/who/note and the history. */
+  // Volume for Excel: rounded to 3 decimals (IFC gives 0.9800000000000001); decimal comma in the BG export so
+  // Bulgarian Excel reads it as a number.
+  const fmtNum = (v) => {
+    const n = typeof v === "number" ? v : parseFloat(String(v == null ? "" : v).replace(",", "."));
+    if (!isFinite(n)) return v == null ? "" : String(v);
+    const t = String(Math.round(n * 1000) / 1000);
+    return lang === "bg" ? t.replace(".", ",") : t;
+  };
   function exportCsv() {
     if (!state.ready) return;
     const rows = state.objects.map((o) => ({
       pour: o.group ? o.group.label : (o.props && o.props[C.P.number]) || "",
       type: (o.props && o.props[C.P.type]) || "",
-      volume: (o.props && o.props[C.P.volume]) || "",
+      volume: fmtNum(o.props && o.props[C.P.volume]),
       parts: (o.props && o.props[C.P.parts]) || "",
       guid: o.guid,
     })).sort((a, b) => C.naturalCompare(a.pour, b.pour) || C.naturalCompare(String(a.type), String(b.type)) || C.naturalCompare(String(a.parts), String(b.parts)));
