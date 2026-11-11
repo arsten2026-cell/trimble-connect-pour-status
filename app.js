@@ -1,6 +1,6 @@
 // Pour status: Trimble Connect 3D-viewer extension for site progress on Tekla pour objects. Each pour object gets a
 // status record (4 steps with date, by, note, history) stored in Trimble Connect's Property Set service on the link
-// frn:entity:{IFC GUID}, in the project library "Arsten Pour Status", so it also shows in Connect's property panel
+// frn:entity:{IFC GUID}, in the project library "CIP/Монолитно", so it also shows in Connect's property panel
 // and survives new IFC versions as long as Tekla keeps the pour object GUIDs.
 (() => {
   "use strict";
@@ -92,7 +92,7 @@
   // ---------- library / definition / records ----------
   async function setup() {
     $("setupBox").hidden = true;
-    const found = await state.client.findLibrary(state.project.id, S.LIB_NAME);
+    const found = await state.client.findLibrary(state.project.id, S.LIB_NAMES);
     if (!found.lib) {
       showSetup(`<b>${lang === "bg" ? "Нужна е еднократна настройка от администратор на проекта." : "One-time setup by a project admin is needed."}</b>
         <ol><li>${lang === "bg" ? "Отворете" : "Open"} <b>Property Set Libraries</b> ${lang === "bg" ? "в менюто на проекта" : "in the project menu"}.</li>
@@ -105,7 +105,7 @@
     state.lib = found.lib;
     try {
       const r = await state.client.ensureDefinition(found.lib.id, S.definition());
-      if (r.created) setStatus("Status fields created in the library " + S.LIB_NAME);
+      if (r.created) setStatus("Status fields created in the library " + found.lib.name);
     } catch (e) {
       if (e.status === 403) {
         showSetup(lang === "bg"

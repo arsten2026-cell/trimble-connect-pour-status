@@ -56,18 +56,23 @@
     }
     getLibrary(libId) { return this.request("pset", `libs/${encodeURIComponent(libId)}`); }
 
-    /** Find the project library with this name. Returns {lib, others} (others: names seen, for messages). */
-    async findLibrary(projectId, name) {
+    /** Find the project library with one of these names (first match in list order wins; case and spaces ignored).
+     *  Returns {lib, others} (others: names seen, for messages). */
+    async findLibrary(projectId, names) {
+      const norm = (x) => String(x || "").replace(/\s+/g, "").toLowerCase();
+      const want = (Array.isArray(names) ? names : [names]).map(norm);
       const ids = await this.projectLibraryIds(projectId);
-      const others = [];
+      const others = [], hits = [];
       for (const id of ids) {
         try {
           const lib = await this.getLibrary(id);
-          if (lib && String(lib.name || "").trim().toLowerCase() === name.toLowerCase()) return { lib, others };
-          if (lib) others.push(lib.name);
+          const rank = lib ? want.indexOf(norm(lib.name)) : -1;
+          if (rank >= 0) hits.push({ rank, lib });
+          else if (lib) others.push(lib.name);
         } catch (e) { if (e.status !== 403 && e.status !== 404) throw e; }
       }
-      return { lib: null, others };
+      hits.sort((a, b) => a.rank - b.rank);
+      return { lib: hits.length ? hits[0].lib : null, others };
     }
 
     /** Make sure the status definition exists in the library and has all fields (creates or extends it). */

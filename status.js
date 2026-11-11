@@ -16,9 +16,11 @@
   ];
   const NOT_STARTED = { id: "none", en: "Not started", bg: "Не е започнат", colour: "#9E9E9E" };
 
-  // Definition stored in the "Arsten Pour Status" library (created once by the extension).
+  // Definition "pourstatus" stored in the project library "CIP/Монолитно" (created once by a project admin in
+  // Connect; the extension adds the definition). The earlier planned name is still accepted.
   const DEF_ID = "pourstatus";
-  const LIB_NAME = "Arsten Pour Status";
+  const LIB_NAME = "CIP/Монолитно";
+  const LIB_NAMES = [LIB_NAME, "Arsten Pour Status"];
   const LOG_MAX = 4000;
 
   /** Property-set definition in the format Connect's own library editor writes (schema.props + i18n labels/order). */
@@ -171,6 +173,6 @@
     return out;
   }
 
-  return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
+  return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
     stepState, summary, matchKey, orphans };
 });
