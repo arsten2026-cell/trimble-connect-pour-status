@@ -173,6 +173,34 @@
     return out;
   }
 
+  /**
+   * CSV of the status of every pour object, for Excel: ";" separated (Bulgarian/European Excel), UTF-8 with BOM so
+   * Cyrillic opens correctly, one row per pour object.
+   * @param rows [{pour, type, volume, parts, guid}] in the order to export
+   * @param records Map guid -> props; lang "bg" | "en"
+   */
+  function toCsv(rows, records, lang) {
+    const bg = lang !== "en";
+    const yes = bg ? "Да" : "Yes", no = bg ? "Не" : "No";
+    const head = [bg ? "Такт" : "Pour", bg ? "Тип" : "Type", bg ? "Обем бетон, m³" : "Concrete volume, m³", bg ? "Елементи" : "Parts",
+      bg ? "Етап" : "Stage"];
+    for (const st of STEPS) head.push(st[bg ? "bg" : "en"], bg ? "Дата" : "Date", bg ? "От" : "By", bg ? "Бележка" : "Note");
+    head.push("IFC GUID", bg ? "История" : "History");
+    const cell = (v) => {
+      const t = String(v == null ? "" : v).replace(/\r?\n/g, " | ");
+      return /[;"\n]/.test(t) || /^\s|\s$/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+    };
+    const lines = [head.map(cell).join(";")];
+    for (const r of rows) {
+      const rec = records.get(r.guid) || {};
+      const line = [r.pour, r.type, r.volume, r.parts, stageOf(rec)[bg ? "bg" : "en"]];
+      for (const st of STEPS) line.push(rec[st.id] ? yes : no, rec[st.id] ? rec[`${st.id}_date`] : "", rec[st.id] ? rec[`${st.id}_by`] : "", rec[st.id] ? rec[`${st.id}_note`] : "");
+      line.push(r.guid, rec.log);
+      lines.push(line.map(cell).join(";"));
+    }
+    return "﻿" + lines.join("\r\n") + "\r\n";
+  }
+
   return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
-    stepState, summary, matchKey, orphans };
+    stepState, summary, matchKey, orphans, toCsv };
 });

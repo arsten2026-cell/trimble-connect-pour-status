@@ -11,7 +11,7 @@
   const T = {
     title: ["Pour status · Статус тактове", "Pour status · Статус тактове"],
     selection: ["Избрано", "Selection"], steps: ["Етапи", "Steps"], view: ["Изглед", "View"], pours: ["Тактове", "Pours"],
-    fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], clear: ["Изчисти", "Clear"],
+    fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], csv: ["Експорт CSV", "Export CSV"], clear: ["Изчисти", "Clear"],
     colour: ["Оцвети по статус", "Colour by status"], orphans: ["Статус без обект", "Status without object"],
     nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
       "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
@@ -191,6 +191,7 @@
 
   // ---------- colours ----------
   const STAGES = [S.NOT_STARTED, ...S.STEPS];
+  const NOT_STARTED_OPACITY = 0.15;
   async function applyColours() {
     const api = state.api;
     const sel = (objs) => {
@@ -199,16 +200,41 @@
       return { modelObjectIds: [...byModel].map(([modelId, objectRuntimeIds]) => ({ modelId, objectRuntimeIds })) };
     };
     if (!state.objects.length) return;
-    if (!state.coloured) return api.viewer.setObjectState(sel(state.objects), { color: "reset" });
+    if (!state.coloured) return api.viewer.setObjectState(sel(state.objects), { color: "reset", opacity: 1 });
     const buckets = STAGES.map(() => []);
     for (const o of state.objects) buckets[S.stageIndex(state.records.get(o.guid))].push(o);
-    for (let k = 0; k < STAGES.length; k++) if (buckets[k].length) await api.viewer.setObjectState(sel(buckets[k]), { color: STAGES[k].colour });
+    // Not started: see-through grey, so what is underneath stays visible. Started: solid stage colour.
+    // Opacity is 0..1 in Connect (verified in Pour tags).
+    for (let k = 0; k < STAGES.length; k++) {
+      if (buckets[k].length) await api.viewer.setObjectState(sel(buckets[k]), { color: STAGES[k].colour, opacity: k === 0 ? NOT_STARTED_OPACITY : 1 });
+    }
+  }
+
+  // ---------- CSV export ----------
+  /** One row per pour object (sorted by pour number, then type), with every step's date/who/note and the history. */
+  function exportCsv() {
+    if (!state.ready) return;
+    const rows = state.objects.map((o) => ({
+      pour: o.group ? o.group.label : (o.props && o.props[C.P.number]) || "",
+      type: (o.props && o.props[C.P.type]) || "",
+      volume: (o.props && o.props[C.P.volume]) || "",
+      parts: (o.props && o.props[C.P.parts]) || "",
+      guid: o.guid,
+    })).sort((a, b) => C.naturalCompare(a.pour, b.pour) || C.naturalCompare(String(a.type), String(b.type)) || C.naturalCompare(String(a.parts), String(b.parts)));
+    const csv = S.toCsv(rows, state.records, lang);
+    const name = `pour-status_${String((state.project && state.project.name) || "project").replace(/[\\/:*?"<>|]+/g, "_").trim()}_${S.today()}.csv`;
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    setStatus(`${lang === "bg" ? "Изтеглен" : "Downloaded"} ${name} (${rows.length} ${lang === "bg" ? "обекта" : "objects"})`);
   }
 
   // ---------- rendering ----------
   function render() {
     $("title").textContent = t("title");
     $("hSel").textContent = t("selection"); $("hSteps").textContent = t("steps"); $("hView").textContent = t("view");
+    $("btnCsv").textContent = t("csv");
     $("hSummary").textContent = t("pours"); $("hOrphans").textContent = t("orphans");
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
     $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
@@ -236,7 +262,7 @@
           class="small secondary" data-act="undo" data-step="${s.id}" ${st.done ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
     }).join("");
     // legend
-    $("legend").innerHTML = STAGES.map((s) => `<span><span class="sw" style="background:${s.colour}"></span>${esc(stepName(s))}</span>`).join("");
+    $("legend").innerHTML = STAGES.map((s, k) => `<span><span class="sw" style="background:${s.colour}${k === 0 ? `;opacity:${NOT_STARTED_OPACITY + 0.25}` : ""}"></span>${esc(stepName(s))}${k === 0 ? ` <span class="sub">(${lang === "bg" ? "прозрачно" : "see-through"})</span>` : ""}</span>`).join("");
     // summary
     const short = lang === "bg" ? ["Кофр.", "Арм.", "Излят", "Декофр."] : ["Form.", "Rebar", "Poured", "Stripped"];
     $("sumHead").innerHTML = `<tr><th>${esc(t("pour"))}</th>${short.map((h) => `<th class="n">${h}</th>`).join("")}<th></th></tr>`;
@@ -289,6 +315,7 @@
     });
   });
   $("btnFromViewer").onclick = () => guarded(selectionFromViewer);
+  $("btnCsv").onclick = () => guarded(exportCsv);
   $("chkFollow").onchange = (e) => {
     state.follow = e.target.checked;
     try { localStorage.setItem("arsten.pourStatus.follow", state.follow ? "1" : "0"); } catch {}
