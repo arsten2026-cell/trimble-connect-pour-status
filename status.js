@@ -37,7 +37,7 @@
     });
     add("pour", { type: "string" }, "Pour / Такт");
     add("key", { type: "string" }, "Match key / Ключ");
-    add("log", { type: "string", format: "long-text", maxLength: LOG_MAX }, "History / История");
+    add("log", { type: "string" }   // "long-text" format is rejected by pset-api (422, 2026-11); length capped in code, "History / История");
     const orderProps = {};
     order.forEach((id, i) => { orderProps[id] = String(i); });
     return {
