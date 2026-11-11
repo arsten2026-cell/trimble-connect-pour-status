@@ -1,0 +1,7 @@
+{
+  "title": "Pour status (Arsten)",
+  "url": "https://arsten2026-cell.github.io/trimble-connect-pour-status/index.html",
+  "icon": "https://arsten2026-cell.github.io/trimble-connect-pour-status/icon.svg",
+  "description": "Record site progress on Tekla pours (formwork, rebar, poured, stripped) with date, who and note. Stored in Trimble Connect property sets.",
+  "extensionType": ["3dviewer"]
+}

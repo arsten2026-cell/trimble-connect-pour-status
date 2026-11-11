@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="bg">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pour status</title>
+<style>
+  :root { --bg:#f7f5f0; --ink:#1f1f1f; --muted:#6b6b6b; --line:#d9d5cc; --accent:#E37424; --tag:#C8102E; --ok:#2f7d32; --bad:#b3261e; --panel:#fff; --mix:#b26a00; }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; padding:12px; background:var(--bg); color:var(--ink); font:13px/1.4 Ubuntu, "Segoe UI", system-ui, sans-serif; }
+  h1 { font-size:15px; margin:0; font-weight:600; }
+  h2 { font-size:12px; margin:14px 0 6px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .top { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+  .top h1 { margin-right:auto; }
+  .status { font-size:12px; color:var(--muted); margin-bottom:8px; min-height:1.4em; }
+  .status.bad { color:var(--bad); }
+  .bar { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0; align-items:center; }
+  button { font:inherit; padding:6px 10px; border:1px solid var(--ink); background:var(--ink); color:#fff; cursor:pointer; border-radius:0; }
+  button.secondary { background:transparent; color:var(--ink); border-color:var(--line); }
+  button.small { padding:2px 7px; font-size:12px; }
+  button:disabled { opacity:.45; cursor:default; }
+  select, input[type=date], input[type=text] { font:inherit; font-size:12px; padding:3px 5px; border:1px solid var(--line); border-radius:0; background:#fff; }
+  .box { background:var(--panel); border:1px solid var(--line); padding:8px; }
+  .warn { background:#fff4e5; border:1px solid #f0c48a; padding:8px; font-size:12px; margin:6px 0; }
+  .warn ol { margin:4px 0 4px 18px; padding:0; }
+  .sel { font-size:12px; }
+  .sel b { font-size:13px; }
+  .steps { display:grid; gap:6px; }
+  .step { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--c); padding:7px 8px; }
+  .step .hd { display:flex; align-items:baseline; gap:6px; }
+  .step .nm { font-weight:600; }
+  .step .st { margin-left:auto; font-size:11px; font-weight:600; white-space:nowrap; }
+  .st.all { color:var(--ok); } .st.mixed { color:var(--mix); } .st.none { color:var(--muted); }
+  .step .dates { font-size:11px; color:var(--muted); }
+  .step .row { display:flex; gap:4px; margin-top:5px; align-items:center; }
+  .step .row input[type=date] { width:122px; flex:none; }
+  .step .row input[type=text] { flex:1; min-width:0; width:0; }
+  .step .row button { white-space:nowrap; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 10px; font-size:11px; margin:4px 0; }
+  .sw { display:inline-block; width:10px; height:10px; margin-right:4px; vertical-align:-1px; border:1px solid rgba(0,0,0,.25); }
+  label.chk { display:inline-flex; align-items:center; gap:4px; font-size:12px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); }
+  th, td { padding:4px 3px; border-bottom:1px solid var(--line); text-align:left; }
+  th { font-size:10.5px; font-weight:600; color:var(--muted); }
+  td.n, th.n { text-align:center; font-variant-numeric:tabular-nums; white-space:nowrap; font-size:11.5px; }
+  td.n.full { color:var(--ok); font-weight:600; } td.n.part { color:var(--mix); font-weight:600; } td.n.zero { color:#b8b4ab; }
+  .name { font-weight:600; white-space:nowrap; }
+  .sub { font-size:11px; color:var(--muted); }
+  .empty { color:var(--muted); font-size:12px; padding:8px 0; }
+</style>
+</head>
+<body>
+<div class="top"><h1 id="title">Pour status · Статус тактове</h1>
+  <select id="selLang" title="Language / Език"><option value="bg">BG</option><option value="en">EN</option></select></div>
+<div id="status" class="status">Connecting to Trimble Connect…</div>
+
+<div id="setupBox" class="warn" hidden></div>
+
+<div id="mainBox" hidden>
+  <h2 id="hSel">Selection</h2>
+  <div class="box sel">
+    <div id="selText"></div>
+    <div class="bar">
+      <button id="btnFromViewer" class="small">Use viewer selection</button>
+      <button id="btnSelClear" class="small secondary">Clear</button>
+    </div>
+  </div>
+
+  <h2 id="hSteps">Steps</h2>
+  <div id="steps" class="steps"></div>
+
+  <h2 id="hView">View</h2>
+  <label class="chk"><input type="checkbox" id="chkColour"> <span id="lblColour">Colour by status</span></label>
+  <div id="legend" class="legend"></div>
+
+  <h2 id="hSummary">Pours</h2>
+  <table>
+    <thead id="sumHead"></thead>
+    <tbody id="sumRows"></tbody>
+  </table>
+
+  <div id="orphanBox" hidden>
+    <h2 id="hOrphans">Status without object</h2>
+    <div id="orphanText" class="warn"></div>
+    <table><tbody id="orphanRows"></tbody></table>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js" integrity="sha384-lFiNt/56q6HnUNbuy0WHO3NP6BkQjY4EH8+5eELYVfnhkB42snRTmSa3UOAlX9gg" crossorigin="anonymous"></script>
+<script src="common.js?v=1"></script>
+<script src="status.js?v=1"></script>
+<script src="psetapi.js?v=1"></script>
+<script src="app.js?v=1"></script>
+</body>
+</html>
