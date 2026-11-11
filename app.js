@@ -159,7 +159,7 @@
     if (!objs.length) return;
     const targets = undo ? objs.filter((o) => (state.records.get(o.guid) || {})[stepId]) : objs;
     if (!targets.length) return setStatus(lang === "bg" ? "Няма какво да се отмени." : "Nothing to undo.");
-    let done = 0, failed = 0;
+    let done = 0, failed = 0, firstErr = "";
     setStatus(`${stepName(step)}: 0/${targets.length}…`);
     await pool(targets, 6, async (o) => {
       const cur = state.records.get(o.guid) || null;
@@ -174,11 +174,12 @@
         failed++;
         if (e.status === 403) throw new Error(lang === "bg" ? "Нямате права да записвате в библиотеката " + S.LIB_NAME + "." : "You have no permission to write to the library " + S.LIB_NAME + ".");
         console.error(e);
+        if (!firstErr) firstErr = e.message || String(e);
       }
       setStatus(`${stepName(step)}: ${done}/${targets.length}…`);
     });
     $("note_" + stepId).value = "";
-    setStatus(`${stepName(step)} ${undo ? (lang === "bg" ? "отменено" : "undone") : (lang === "bg" ? "записано" : "saved")}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"}` : ""), failed > 0);
+    setStatus(`${stepName(step)} ${undo ? (lang === "bg" ? "отменено" : "undone") : (lang === "bg" ? "записано" : "saved")}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : ""), failed > 0);
     render();
     if (state.coloured) await applyColours();
   }

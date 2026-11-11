@@ -107,9 +107,9 @@
     const r = Object.assign({}, rec || {});
     if (!r[stepId]) return r;
     r[stepId] = false;
-    r[`${stepId}_date`] = "";
-    r[`${stepId}_by`] = "";
-    r[`${stepId}_note`] = "";
+    r[`${stepId}_date`] = null;   // "" is rejected for date fields (422); null clears
+    r[`${stepId}_by`] = null;
+    r[`${stepId}_note`] = null;
     r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`;
     r.log = appendLog(r.log, logLine(`undone: ${step.en} by ${(info && info.by) || "?"}`, info && info.now));
     return r;
