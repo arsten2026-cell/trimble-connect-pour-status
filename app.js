@@ -230,7 +230,7 @@
   }
 
   // ---------- colours ----------
-  const STAGES = [S.NOT_STARTED, ...S.STEPS];
+  const STAGES = S.STAGES;   // not started, formwork, rebar first (formwork pending), rebar, poured, stripped
   const NOT_STARTED_OPACITY = 0.15;
   async function applyColours() {
     const api = state.api;
@@ -242,7 +242,7 @@
     if (!state.objects.length) return;
     if (!state.coloured) return api.viewer.setObjectState(sel(state.objects), { color: "reset", opacity: 1 });
     const buckets = STAGES.map(() => []);
-    for (const o of state.objects) buckets[S.stageIndex(state.records.get(o.guid))].push(o);
+    for (const o of state.objects) buckets[STAGES.indexOf(S.stageOf(state.records.get(o.guid)))].push(o);
     // Not started: see-through grey, so what is underneath stays visible. Started: solid stage colour.
     // Opacity is 0..1 in Connect (verified in Pour tags).
     for (let k = 0; k < STAGES.length; k++) {

@@ -15,6 +15,10 @@
     { id: "stripped", en: "Formwork removed", bg: "Декофриран", colour: "#1F4FD1", na: true },
   ];
   const NOT_STARTED = { id: "none", en: "Not started", bg: "Не е започнат", colour: "#9E9E9E" };
+  // Rebar done before formwork (e.g. columns): not ready to pour yet, so not the same colour as "rebar done".
+  const REBAR_FIRST = { id: "rebar_first", en: "Rebar done, formwork pending", bg: "Армировка готова, кофраж предстои", colour: "#EC6FA0" };
+  /** All stages in legend order. */
+  const STAGES = [NOT_STARTED, STEPS[0], REBAR_FIRST, STEPS[1], STEPS[2], STEPS[3]];
 
   // Definition "pourstatus" stored in the project library "CIP/Монолитно" (created once by a project admin in
   // Connect; the extension adds the definition). The earlier planned name is still accepted.
@@ -98,7 +102,12 @@
     });
     return k;
   }
-  const stageOf = (rec) => (stageIndex(rec) ? STEPS[stageIndex(rec) - 1] : NOT_STARTED);
+  function stageOf(rec) {
+    const k = stageIndex(rec);
+    if (!k) return NOT_STARTED;
+    if (STEPS[k - 1].id === "rebar" && !rec.formwork) return REBAR_FIRST;   // formwork (or "without") still to come
+    return STEPS[k - 1];
+  }
 
   function logLine(text, when) {
     const t = when || new Date();
@@ -504,6 +513,6 @@
     return r;
   }
 
-  return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
+  return { STEPS, NOT_STARTED, REBAR_FIRST, STAGES, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
     markNa, isNa, setNote, splits, inherit, splitDone, merges, mergeBack, mergedInto, bboxText, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
 });
