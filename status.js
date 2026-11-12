@@ -343,6 +343,17 @@
   const overlaps = (c, p) => AXES.every((a) => Math.min(c.max[a], p.max[a]) - Math.max(c.min[a], p.min[a]) > tolOf(p, a));
   const boxVol = (b) => AXES.reduce((v, a) => v * Math.max(0, b.max[a] - b.min[a]), 1);
   const overlapShare = (c, p) => { const v = boxVol(c); return v > 0 ? AXES.reduce((t, a) => t * Math.max(0, Math.min(c.max[a], p.max[a]) - Math.max(c.min[a], p.min[a])), 1) / v : 0; };
+  const unionBox = (bs) => ({ min: Object.fromEntries(AXES.map((a) => [a, Math.min(...bs.map((b) => b.min[a]))])),
+    max: Object.fromEntries(AXES.map((a) => [a, Math.max(...bs.map((b) => b.max[a]))])) });
+  const CENTRE_TOL = 0.75;   // matchKey rounds the centre to 0.5 model units
+  function connected(start, sub) {
+    const reached = [start], rest = sub.slice();
+    for (let grew = true; grew && rest.length;) {
+      grew = false;
+      for (let i = rest.length - 1; i >= 0; i--) if (reached.some((x) => touches(rest[i].bbox, x.bbox))) { reached.push(rest.splice(i, 1)[0]); grew = true; }
+    }
+    return !rest.length;
+  }
   const touches = (c, p) => AXES.every((a) => Math.min(c.max[a], p.max[a]) - Math.max(c.min[a], p.min[a]) >= -tolOf(p, a));
   const partTokens = (s) => new Set(String(s || "").split(";").map((x) => x.replace(/\s+x\d+\s*$/, "").trim()).filter(Boolean));
   const INHERIT = ["formwork", "rebar"];   // what a piece of a split pour inherits; never poured/stripped
@@ -387,7 +398,27 @@
         if (!cur || !cur.bbox || !r.key) continue;
         const [, , newCentre] = String(cur.key || "").split("|");
         if (oldCentre === newCentre || !tokens.size) continue;   // geometry unchanged (a renumber alone is not a split)
-        children = free.filter((o) => o.guid !== guid && o.pour === r.pour && touches(o.bbox, cur.bbox) && sameParts(o));
+        // Candidates: same pour number and parts, connected to the kept piece (directly or through another candidate).
+        const pool = free.filter((o) => o.guid !== guid && o.pour === r.pour && sameParts(o));
+        const comp = [];
+        for (let grew = true; grew && comp.length < 10;) {
+          grew = false;
+          for (const o of pool) if (!comp.includes(o) && [cur, ...comp].some((x) => touches(o.bbox, x.bbox))) { comp.push(o); grew = true; }
+        }
+        // The real pieces + the kept piece rebuild the original: the centre saved at marking must match again.
+        const [ox, oy, oz] = String(oldCentre || "").split(",").map(Number);
+        let best = null;
+        if ([ox, oy, oz].every(isFinite)) {
+          for (let m = 1; m < 1 << comp.length; m++) {
+            const sub = comp.filter((_, i) => (m >> i) & 1);
+            if (!connected(cur, sub)) continue;   // pieces form one chain from the kept piece, no gaps
+            const u = unionBox([cur.bbox, ...sub.map((o) => o.bbox)]);
+            const dist = Math.max(Math.abs((u.min.x + u.max.x) / 2 - ox), Math.abs((u.min.y + u.max.y) / 2 - oy), Math.abs(u.min.z - oz));
+            if (dist <= CENTRE_TOL && (!best || dist < best.dist - 1e-9 || (Math.abs(dist - best.dist) < 1e-9 && sub.length < best.sub.length))) best = { dist, sub };
+          }
+        }
+        children = best ? best.sub : [];
+        partial = comp.filter((o) => !children.includes(o));   // offered unticked: probably neighbours
       }
       if (children.length || partial.length) out.push({ guid, record: r, present: !!cur, exact, steps, children, partial, sumVol, snapVol: isFinite(snapVol) ? snapVol : null, volOk });
     }

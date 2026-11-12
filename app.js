@@ -456,7 +456,7 @@
           : `${L2("обем", "volume")} ${f3(x.snapVol)} m³ ${x.volOk ? "= " : "≠ "}${f3(x.sumVol)} ${x.volOk ? "✓" : "⚠"}`;
         const row = (o, k, ticked, tag) => `<label class="chk"><input type="checkbox" data-split="${i}" data-k="${k}" ${ticked ? "checked" : ""}> ${esc(o.pour || "?")} · ${f3(o.volume)} m³${tag ? ` <span class="sub">${tag}</span>` : ""}</label>`;
         const kids = [...x.children.map((o, k) => row(o, k, true, x.exact ? "" : L2("(проверете)", "(check)"))),
-          ...x.partial.map((o, k) => row(o, x.children.length + k, false, L2("(частично извън)", "(partly outside)")))].join("<br>");
+          ...x.partial.map((o, k) => row(o, x.children.length + k, false, x.exact ? L2("(частично извън)", "(partly outside)") : L2("(вероятно съседен)", "(probably a neighbour)")))].join("<br>");
         return `<tr><td><span class="name">${esc(x.record.pour || "?")}</span> <span class="sub">${x.present ? "" : L2("(вече го няма)", "(gone)")}</span>
           <div class="sub">${esc(what)} · ${vol}</div><div style="margin:4px 0">${kids}</div>
           <button class="small" data-act="splitApply" data-i="${i}">${L2("Прехвърли", "Pass on")}</button>

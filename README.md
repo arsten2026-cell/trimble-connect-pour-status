@@ -36,7 +36,8 @@ every other piece a new GUID (no status). No parent link is exported, so the pan
   fully inside the saved outline are pieces (pour number may differ), objects with at least 20 % of their box inside
   are "partial" (offered unticked). Pieces must share a part name with the original (`key`), so anchors or lean
   concrete inside the outline are not taken. Kept + pieces volume is checked against `snap_volume` (2 %).
-- Records from before outlines were saved: pieces with the same pour number, touching the kept object, sharing parts.
+- Records from before outlines were saved: same pour number and parts, connected to the kept object, and kept +
+  pieces must rebuild the centre saved in `key` at marking (others are offered unticked as probable neighbours).
 - Panel section "Разделени тактове": ticked pieces, volume check, Прехвърли (pieces get formwork/rebar with the
   parent's date/who, `split_from`, quantity 0 when the parent's quantity is frozen), Покажи, Не (keep as is).
 - Excel uses the frozen quantity of each step; Детайли has "Записано ≠ модел" where it differs from the model now.
