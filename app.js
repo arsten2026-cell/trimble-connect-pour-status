@@ -582,46 +582,21 @@
   }
 
 
-  // ---------- policy lab (admins, ?lab=1, ONLY libraries named "ZZ_TEST…"): what policy does Connect's library access control produce, can I write? ----------
-  async function runLab() {
-    const out = [];
-    const log = (k, v) => { out.push(`${k}: ${typeof v === "string" ? v : JSON.stringify(v, null, 1)}`); $("labOut").textContent = out.join("\n\n"); };
-    if (!state.access || state.access.role !== "admin") return log("lab", "admins only");
-    const ids = await state.client.projectLibraryIds(state.project.id);
-    let lib = null;
-    for (const id of ids) { try { const l = await state.client.getLibrary(id); if (/^ZZ_TEST/i.test((l && l.name) || "")) { lib = l; break; } } catch {} }
-    if (!lib) return log("lab", "no library named ZZ_TEST… in this project");
-    log("library", { id: lib.id, name: lib.name });
-    const def = { id: "labdef", name: "Lab", schema: { props: { v: { type: "string" } } },
-      i18n: { "en-US": { name: "Lab", props: { v: "Value" } }, "__prop-order__": { name: "__prop-order__", props: { v: "0" } } } };
-    try { await state.client.ensureDefinition(lib.id, def); log("definition", "OK"); } catch (e) { return log("definition", "FAIL " + errText(e)); }
-    const link = "frn:entity:ZZLABTEST000000000000001";
-    const path = `psets/${encodeURIComponent(link)}/${encodeURIComponent(lib.id)}/labdef`;
-    const tryWrite = async (tag) => { try { await state.client.request("pset", path, "PATCH", { props: { v: `${tag} ${new Date().toISOString()}` } }); return "OK"; } catch (e) { return `FAIL ${e.status || ""} ${errText(e)}`; } };
-    const tryRead = async () => { try { const r = await state.client.readMany(lib.id, "labdef", [link]); return r.has(link) ? "OK " + JSON.stringify(r.get(link)) : "OK (no value)"; } catch (e) { return `FAIL ${e.status || ""} ${errText(e)}`; } };
-    const get = async () => { try { return await state.client.getPolicy(lib.id); } catch (e) { return `FAIL ${e.status || ""} ${errText(e)}`; } };
-    const original = await get();
-    log("policy (original)", original);
-    log("write as me, original policy", await tryWrite("orig"));
-    log("read", await tryRead());
-    // Access is set with Connect's own "Library access control" (groups); the lab only reads the resulting policy
-    // and tries a write and a read as the current user. It never changes a policy.
-    log("done", "delete the ZZ_TEST library in Connect when finished");
-  }
 
   // ---------- write protection (admins): who may write statuses in the library ----------
   async function loadProtection() {
     if (!state.access || state.access.role !== "admin" || !state.lib) { $("protectBox").hidden = true; return; }
     $("protectBox").hidden = false;
-    $("labBox").hidden = !/[?&]lab=1\b/.test(location.search);
     try {
       const policy = await state.client.getPolicy(state.lib.id);
-      const w = ArstenAccess.policyWriters(policy);
+      const d = ArstenAccess.describePolicy(policy);
       state.policy = policy;
-      $("protectText").textContent = w === "everyone" ? L2("Всеки член на проекта може да записва статуси (защитата е само в панела).", "Every project member can write statuses (protected in the panel only).")
-        : w === "nobody" ? L2("Библиотеката няма собствено правило за запис: записът се разрешава от Connect на членовете на проекта (защитата е само в панела).",
-          "The library has no write rule of its own: Connect lets project members write (protected in the panel only).")
-        : L2(`Записват само ${w.length} потребители (ADMIN + GENERAL CONTRACTOR).`, `Only ${w.length} users can write (ADMIN + GENERAL CONTRACTOR).`);
+      const names = new Map(((await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken })).groups || []).map((g) => [g.id, g.name]));
+      const lv = { edit: L2("запис", "edit"), read: L2("само четене", "read only"), none: L2("без достъп", "no access") };
+      const lines = [`${L2("Всички членове", "All members")}: ${lv[d.defaultAccess]}`]
+        .concat(d.groups.map((g) => `${names.get(g.id) || L2("група", "group") + " " + g.id}: ${lv[g.access]}`))
+        .concat([d.adminsWrite || d.everyoneWrites ? "" : L2("ADMIN: записва само ако е в група със запис.", "ADMIN: can write only through a group with edit access.")]).filter(Boolean);
+      $("protectText").innerHTML = lines.map((x) => `<div>${esc(x)}</div>`).join("") + `<div class="sub" style="margin-top:4px">${esc(L2("Промяна: Property Set Libraries → CIP/Монолитно → иконата с човек (Library access control) → Save → Publish.", "Change it in Property Set Libraries → CIP/Монолитно → person icon (Library access control) → Save → Publish."))}</div>`;
     } catch (e) {
       $("protectText").textContent = L2("Правата на библиотеката не могат да се прочетат: ", "Cannot read the library rights: ") + errText(e);
     }
@@ -635,19 +610,6 @@
     } catch (e) {
       $("rolesList").textContent = L2("Ролите не могат да се прочетат: ", "Cannot read the roles: ") + errText(e);
     }
-  }
-  async function protectWrites() {
-    const w = await ArstenAccess.writerSubs({ projectId: state.project.id, location: state.project.location, getToken });
-    const msg = w.gcGroupFound
-      ? L2(`Само ${w.admins} администратори и ${w.gcMembers} от GENERAL CONTRACTOR ще могат да записват статуси. Останалите само ще четат. При промяна на групата натиснете отново. Продължаване?`,
-        `Only ${w.admins} admins and ${w.gcMembers} GENERAL CONTRACTOR members will be able to write statuses; everyone else read only. Press again when the group changes. Continue?`)
-      : L2(`Групата GENERAL CONTRACTOR не съществува: само ${w.admins} администратори ще могат да записват. Продължаване?`,
-        `The group GENERAL CONTRACTOR does not exist: only ${w.admins} admins will be able to write. Continue?`);
-    if (!w.subs.length || !window.confirm(msg)) return;
-    const current = state.policy || await state.client.getPolicy(state.lib.id);
-    await state.client.putPolicy(state.lib.id, ArstenAccess.writersPolicy(current, w.subs));
-    setStatus(L2("Правата за запис са обновени.", "Write rights updated."));
-    await loadProtection();
   }
 
   // Re-attach an orphaned status: copy it to the candidate object(s) (the old record stays, for history).
@@ -678,8 +640,6 @@
       else if (act === "splitSkip") await splitSkip(+b.dataset.i);
       else if (act === "splitShow") await splitShow(+b.dataset.i);
       else if (act === "mergeApply") await mergeApply(+b.dataset.i);
-      else if (act === "protect") await protectWrites();
-      else if (act === "lab") await runLab();
       else if (act === "mergeShow") await mergeShow(+b.dataset.i);
     });
   });
