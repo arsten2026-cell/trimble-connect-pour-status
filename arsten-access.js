@@ -1,12 +1,12 @@
 // Arsten access control for Trimble Connect extensions (role-based, fail closed).
 //
 // Roles, from the Connect project (ALL configuration is in GROUP_ROLES and APPS below):
-//   admin  - project role ADMIN                          -> everything
+//   admin  - project role ADMIN, or group "00_ADMIN"     -> everything
 //   gc     - group "GENERAL CONTRACTOR" (1028: "02.GENERAL CONTRACTOR") -> execution extensions
 //   client - group "CLIENT" ("01.CLIENT")                -> "Project status" (client viewer)
 //   subcontractor / designer / viewer - groups "03.SUBCONTRACTORS" / "04.DESIGNERS" / "05.VIEWERS" -> nothing yet
 //   none   - anyone else, or the role cannot be determined -> no access
-// Group names are matched without a leading number prefix ("02." / "2 " / "02-"), case- and space-insensitively.
+// Group names are matched without a leading number prefix ("02." / "00_" / "2 " / "02-"), case- and space-insensitively.
 // To give a group access later: add its role to the app's list in APPS (or map the group to an existing role).
 //
 // Usage (browser, after TrimbleConnectWorkspace.connect):
@@ -29,6 +29,7 @@
 
   /** Connect group name (without its number prefix) -> role. */
   const GROUP_ROLES = {
+    "ADMIN": "admin",              // group "00_ADMIN": same rights as a Connect project admin
     "GENERAL CONTRACTOR": "gc",
     "CLIENT": "client",
     "SUBCONTRACTORS": "subcontractor",
@@ -46,7 +47,7 @@
   const sameUser = (a, b) => !!a && !!b && ((a.id && b.id && a.id === b.id) || (a.email && b.email && norm(a.email) === norm(b.email))
     || (a.tiduuid && b.tiduuid && a.tiduuid === b.tiduuid));
 
-  /** Group name as matched: number prefix ("02.", "2 ", "02-") and extra spaces removed, lower case. */
+  /** Group name as matched: number prefix ("02.", "00_", "2 ", "02-") and extra spaces removed, lower case. */
   const groupKey = (name) => norm(name).replace(/^\d+\s*[.)\-_:]?\s*/, "").trim();
   /** Effective config: defaults + overrides. Old style config.groups {gc: "NAME"} is still accepted. */
   function conf(config) {
