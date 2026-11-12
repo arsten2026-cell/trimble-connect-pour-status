@@ -130,6 +130,10 @@
       return out;
     }
 
+    /** Library access policy (needs pset:GetLibraryPolicy / org:UpdateLibraryPolicy; project admins). */
+    getPolicy(libId) { return this.request("pset", `libs/${encodeURIComponent(libId)}/policy`); }
+    putPolicy(libId, policy) { return this.request("pset", `libs/${encodeURIComponent(libId)}/policy`, "PUT", policy); }
+
     /** Write (create or update) the status of one object. PATCH merges: fields left out keep their value. */
     write(libId, defId, link, props) {
       return this.request("pset", psetPath(link, libId, defId), "PATCH", { props: clean(props) });

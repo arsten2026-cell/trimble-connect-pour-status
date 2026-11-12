@@ -581,6 +581,45 @@
     if (o) await selectObjects([o]);
   }
 
+  // ---------- write protection (admins): who may write statuses in the library ----------
+  async function loadProtection() {
+    if (!state.access || state.access.role !== "admin" || !state.lib) { $("protectBox").hidden = true; return; }
+    $("protectBox").hidden = false;
+    try {
+      const policy = await state.client.getPolicy(state.lib.id);
+      const w = ArstenAccess.policyWriters(policy);
+      state.policy = policy;
+      $("protectText").textContent = w === "everyone" ? L2("Всеки член на проекта може да записва статуси (защитата е само в панела).", "Every project member can write statuses (protected in the panel only).")
+        : w === "nobody" ? L2("Никой не може да записва статуси.", "Nobody can write statuses.")
+        : L2(`Записват само ${w.length} потребители (ADMIN + GENERAL CONTRACTOR).`, `Only ${w.length} users can write (ADMIN + GENERAL CONTRACTOR).`);
+    } catch (e) {
+      $("protectText").textContent = L2("Правата на библиотеката не могат да се прочетат: ", "Cannot read the library rights: ") + errText(e);
+    }
+    // Who resolves to which role (names only), so the groups can be checked.
+    try {
+      const data = await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
+      const RN = { admin: "ADMIN", gc: "GENERAL CONTRACTOR", client: "CLIENT", subcontractor: "SUBCONTRACTORS", designer: "DESIGNERS", viewer: "VIEWERS", none: L2("без достъп", "no access") };
+      const list = ArstenAccess.classifyMembers(data).sort((x, y) => ArstenAccess.ROLE_ORDER.indexOf(x.role) - ArstenAccess.ROLE_ORDER.indexOf(y.role) || x.name.localeCompare(y.name));
+      $("rolesList").innerHTML = list.map((m) => `<div>${esc(m.name)} · <b>${esc(RN[m.role] || m.role)}</b>${ArstenAccess.allows("execution", m.role) ? "" : ` <span class="sub">(${L2("без достъп до панела", "no panel access")})</span>`}</div>`).join("");
+      state.roleList = list;
+    } catch (e) {
+      $("rolesList").textContent = L2("Ролите не могат да се прочетат: ", "Cannot read the roles: ") + errText(e);
+    }
+  }
+  async function protectWrites() {
+    const w = await ArstenAccess.writerSubs({ projectId: state.project.id, location: state.project.location, getToken });
+    const msg = w.gcGroupFound
+      ? L2(`Само ${w.admins} администратори и ${w.gcMembers} от GENERAL CONTRACTOR ще могат да записват статуси. Останалите само ще четат. При промяна на групата натиснете отново. Продължаване?`,
+        `Only ${w.admins} admins and ${w.gcMembers} GENERAL CONTRACTOR members will be able to write statuses; everyone else read only. Press again when the group changes. Continue?`)
+      : L2(`Групата GENERAL CONTRACTOR не съществува: само ${w.admins} администратори ще могат да записват. Продължаване?`,
+        `The group GENERAL CONTRACTOR does not exist: only ${w.admins} admins will be able to write. Continue?`);
+    if (!w.subs.length || !window.confirm(msg)) return;
+    const current = state.policy || await state.client.getPolicy(state.lib.id);
+    await state.client.putPolicy(state.lib.id, ArstenAccess.writersPolicy(current, w.subs));
+    setStatus(L2("Правата за запис са обновени.", "Write rights updated."));
+    await loadProtection();
+  }
+
   // Re-attach an orphaned status: copy it to the candidate object(s) (the old record stays, for history).
   async function reattach(x) {
     const ok = window.confirm(lang === "bg"
@@ -609,6 +648,7 @@
       else if (act === "splitSkip") await splitSkip(+b.dataset.i);
       else if (act === "splitShow") await splitShow(+b.dataset.i);
       else if (act === "mergeApply") await mergeApply(+b.dataset.i);
+      else if (act === "protect") await protectWrites();
       else if (act === "mergeShow") await mergeShow(+b.dataset.i);
     });
   });
@@ -653,11 +693,15 @@
     state.ready = true;
     $("mainBox").hidden = false;
     const inModel = state.objects.filter((o) => state.records.has(o.guid)).length, outside = state.records.size - inModel;
+    loadProtection();
     setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}${outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : ""}`);
     render();
   }
   async function start(api, client) {
     state.api = api;
+    // Access first (shared/arsten-access.js): ADMIN or GENERAL CONTRACTOR group. Nothing is read before.
+    state.access = window.ARSTEN_DEMO ? { allowed: true, role: "admin" } : await ArstenAccess.check({ api, getToken, app: "execution" });
+    if (!state.access.allowed) { state.denied = true; state.api = null; ArstenAccess.renderDenied(document.body, lang, state.access); return; }
     state.project = (await api.project.getProject()) || {};
     try { const u = await api.user.getUser(); state.user = [u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || ""; } catch {}
     state.client = client || new A.PsetClient({ region: state.project.location || "europe", getToken });
@@ -668,6 +712,7 @@
 
   function onEvent(event, data) {
     if (event === "extension.accessToken") onToken(data);
+    if (state.denied) return;
     if (event === "viewer.onSelectionChanged") onViewerSelection();
     if (event === "viewer.onModelStateChanged" && state.api) { state.objects = []; state.sel = []; guarded(start2); }
   }
