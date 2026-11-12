@@ -12,3 +12,14 @@ Install: project → Settings → Apps & Capabilities → + Add Custom →
 `https://arsten2026-cell.github.io/trimble-connect-pour-status/manifest.json`.
 
 Static files only; the panel talks to Trimble Connect directly with the signed-in user's access.
+
+## Excel export (for invoicing)
+"Експорт Excel" next to the Pours heading downloads `pour-status_{project}_{date}.xlsx` (ExcelJS 4.4.0, loaded from
+jsDelivr with SRI only when the button is pressed). Sheets:
+- **По месеци / By month**: per month and pour type, how many objects reached each step and the quantity it earns
+  (formwork done and stripped: formwork m² = sides + bottom; rebar done: rebar kg; poured: concrete m³), counted in
+  the month of the step's date. Filter the month: the Total row uses SUBTOTAL, so it sums only visible rows.
+- **По тактове / By pour**: totals per pour and what is done so far, % of volume poured, last pour date.
+- **Детайли / Details**: one row per pour object with quantities, real dates, who, note, GUID, history.
+Quantities come from the Tekla pour export (Pour/Такт pset). `S.invoiceData` is unit-tested; `S.toCsv` is kept but no
+longer used by the panel.

@@ -11,7 +11,7 @@
   const T = {
     title: ["Pour status · Статус тактове", "Pour status · Статус тактове"],
     selection: ["Избрано", "Selection"], steps: ["Етапи", "Steps"], view: ["Изглед", "View"], pours: ["Тактове", "Pours"],
-    fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], csv: ["Експорт CSV", "Export CSV"], clear: ["Изчисти", "Clear"],
+    fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], csv: ["Експорт Excel", "Export Excel"], clear: ["Изчисти", "Clear"],
     colour: ["Оцвети по статус", "Colour by status"], orphans: ["Статус без обект", "Status without object"],
     nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
       "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
@@ -210,32 +210,147 @@
     }
   }
 
-  // ---------- CSV export ----------
-  /** One row per pour object (sorted by pour number, then type), with every step's date/who/note and the history. */
-  // Volume for Excel: rounded to 3 decimals (IFC gives 0.9800000000000001); decimal comma in the BG export so
-  // Bulgarian Excel reads it as a number.
-  const fmtNum = (v) => {
-    const n = typeof v === "number" ? v : parseFloat(String(v == null ? "" : v).replace(",", "."));
-    if (!isFinite(n)) return v == null ? "" : String(v);
-    const t = String(Math.round(n * 1000) / 1000);
-    return lang === "bg" ? t.replace(".", ",") : t;
-  };
-  function exportCsv() {
+  // ---------- Excel export (for invoicing) ----------
+  // ExcelJS is loaded only when the button is pressed (about 1 MB).
+  const EXCELJS = "https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js";
+  const EXCELJS_SRI = "sha384-Pqp51FUN2/qzfxZxBCtF0stpc9ONI6MYZpVqmo8m20SoaQCzf+arZvACkLkirlPz";
+  let excelLoad = null;
+  function loadExcelJs() {
+    if (window.ExcelJS) return Promise.resolve(window.ExcelJS);
+    return excelLoad || (excelLoad = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = EXCELJS; s.integrity = EXCELJS_SRI; s.crossOrigin = "anonymous";
+      s.onload = () => resolve(window.ExcelJS);
+      s.onerror = () => { excelLoad = null; reject(new Error("Could not load the Excel library (" + EXCELJS + ")")); };
+      document.head.appendChild(s);
+    }));
+  }
+  const toNum = (v) => { const n = typeof v === "number" ? v : parseFloat(String(v == null ? "" : v).replace(",", ".")); return isFinite(n) ? n : null; };
+  const toDate = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(s || "")); return m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])) : null; };
+  const round = (v, d) => (v == null ? null : Math.round(v * 10 ** d) / 10 ** d);
+
+  /**
+   * Workbook with three sheets: by month (each step counted in the month of its date, per pour type, with the
+   * quantity it earns: formwork/stripping m², rebar kg, concrete m³), by pour, and one row per pour object.
+   * Real numbers and dates, filters, and totals that follow the filter (SUBTOTAL), so a month can be filtered and
+   * its totals read off for the invoice.
+   */
+  async function exportExcel() {
     if (!state.ready) return;
-    const rows = state.objects.map((o) => ({
-      pour: o.group ? o.group.label : (o.props && o.props[C.P.number]) || "",
-      type: (o.props && o.props[C.P.type]) || "",
-      volume: fmtNum(o.props && o.props[C.P.volume]),
-      parts: (o.props && o.props[C.P.parts]) || "",
-      guid: o.guid,
-    })).sort((a, b) => C.naturalCompare(a.pour, b.pour) || C.naturalCompare(String(a.type), String(b.type)) || C.naturalCompare(String(a.parts), String(b.parts)));
-    const csv = S.toCsv(rows, state.records, lang);
-    const name = `pour-status_${String((state.project && state.project.name) || "project").replace(/[\\/:*?"<>|]+/g, "_").trim()}_${S.today()}.csv`;
-    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const bg = lang === "bg", L = (b, e) => (bg ? b : e);
+    setStatus(L("Подготвям Excel…", "Preparing Excel…"));
+    const ExcelJS = await loadExcelJs();
+    const objs = state.objects.map((o) => {
+      const p = o.props || {};
+      const fw = (toNum(p[C.P.fwSides]) || 0) + (toNum(p[C.P.fwBottom]) || 0);
+      return {
+        pour: o.group ? o.group.label : p[C.P.number] || "", type: String(p[C.P.type] || ""), parts: String(p[C.P.parts] || ""), guid: o.guid,
+        volume: round(toNum(p[C.P.volume]), 3), rebar: round(toNum(p[C.P.rebar]), 1), formwork: fw ? round(fw, 2) : null,
+      };
+    }).sort((a, b) => C.naturalCompare(a.pour, b.pour) || C.naturalCompare(a.type, b.type) || C.naturalCompare(a.parts, b.parts));
+    const data = S.invoiceData(objs, state.records);
+
+    const UNIT = { formwork: "m²", rebar: "kg", poured: "m³", stripped: "m²" };
+    const FMT = { m3: "#,##0.00", m2: "#,##0.00", kg: "#,##0", n: "0", date: bg ? "dd.mm.yyyy" : "yyyy-mm-dd", pct: "0%" };
+    const fmtOf = (u) => (u === "kg" ? FMT.kg : FMT.m2);
+    const INK = "FF1F1F1F", LINE = "FFD9D5CC", ACC = "FFE37424", SOFT = "FFF7F5F0", MUTED = "FF6B6B6B";
+    const font = { name: "Ubuntu", size: 10 };
+    const project = (state.project && state.project.name) || "";
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "Arsten Pour status"; wb.created = new Date();
+    wb.calcProperties.fullCalcOnLoad = true;
+
+    function addSheet(name, note, cols, rows, freezeCols) {
+      const ws = wb.addWorksheet(name, { views: [{ state: "frozen", xSplit: freezeCols || 0, ySplit: 3 }] });
+      ws.getCell(1, 1).value = `${project} · ${L("Статус тактове", "Pour status")} · ${name} · ${S.today()}`;
+      ws.getCell(1, 1).font = Object.assign({}, font, { size: 12, bold: true });
+      ws.getCell(2, 1).value = note;
+      ws.getCell(2, 1).font = Object.assign({}, font, { size: 9, italic: true, color: { argb: MUTED } });
+      const hr = ws.getRow(3);
+      hr.height = 32;
+      cols.forEach((c, i) => {
+        const cell = hr.getCell(i + 1);
+        cell.value = c.h;
+        cell.font = Object.assign({}, font, { bold: true, color: { argb: "FFFFFFFF" } });
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: INK } };
+        cell.alignment = { vertical: "middle", wrapText: true, horizontal: c.fmt && c.fmt !== FMT.date ? "right" : "left" };
+        ws.getColumn(i + 1).width = c.w || 12;
+      });
+      rows.forEach((r, k) => {
+        const row = ws.getRow(4 + k);
+        r.forEach((v, i) => {
+          const cell = row.getCell(i + 1);
+          cell.value = v == null || v === "" ? null : v;
+          cell.font = font;
+          if (cols[i].fmt) cell.numFmt = cols[i].fmt;
+          cell.border = { bottom: { style: "hair", color: { argb: LINE } } };
+        });
+      });
+      const last = 3 + rows.length;
+      if (rows.length) ws.autoFilter = { from: { row: 3, column: 1 }, to: { row: last, column: cols.length } };
+      if (cols.some((c) => c.sum)) {
+        const tr = ws.getRow(last + 1);
+        cols.forEach((c, i) => {
+          const cell = tr.getCell(i + 1);
+          if (i === 0) cell.value = L("Общо (видимите редове)", "Total (visible rows)");
+          if (c.sum && rows.length) {
+            const col = ws.getColumn(i + 1).letter;
+            cell.value = { formula: `SUBTOTAL(109,${col}4:${col}${last})`, result: round(rows.reduce((s, r) => s + (typeof r[i] === "number" ? r[i] : 0), 0), 3) };
+            cell.numFmt = c.fmt;
+          }
+          cell.font = Object.assign({}, font, { bold: true });
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: SOFT } };
+          cell.border = { top: { style: "medium", color: { argb: ACC } } };
+        });
+      }
+      return ws;
+    }
+
+    const qtyNote = L("Количества от модела (Tekla): кофраж = страни + дъно (m²), армировка (kg), бетон (m³). ",
+      "Quantities from the model (Tekla): formwork = sides + bottom (m²), rebar (kg), concrete (m³). ");
+    const stepCols = () => S.STEPS.flatMap((st) => [
+      { h: `${stepName(st)}, ${L("бр.", "pcs")}`, w: 10, fmt: FMT.n, sum: true },
+      { h: `${stepName(st)}, ${UNIT[st.id]}`, w: 13, fmt: fmtOf(UNIT[st.id]), sum: true }]);
+    const stepVals = (s) => S.STEPS.flatMap((st) => [s[st.id].n || null, s[st.id].n ? round(s[st.id].qty, 2) : null]);
+
+    // 1) By month: what each step earned in the month of its date.
+    addSheet(L("По месеци", "By month"),
+      qtyNote + L("Всеки етап се отчита в месеца на датата си. Филтрирайте „Месец“ – редът „Общо“ сумира само видимите редове.",
+        "Each step counts in the month of its date. Filter \"Month\": the Total row sums only the visible rows."),
+      [{ h: L("Месец", "Month"), w: 11 }, { h: L("Тип", "Type"), w: 30 }, ...stepCols()],
+      data.months.map((m) => [m.month || L("без дата", "no date"), m.type, ...stepVals(m)]), 2);
+    // 2) By pour: progress and the quantities done so far.
+    addSheet(L("По тактове", "By pour"), qtyNote,
+      [{ h: L("Такт", "Pour"), w: 12 }, { h: L("Тип", "Type"), w: 30 }, { h: L("Обекти", "Objects"), w: 8, fmt: FMT.n, sum: true },
+        { h: L("Бетон общо, m³", "Concrete total, m³"), w: 12, fmt: FMT.m3, sum: true }, { h: L("Армировка общо, kg", "Rebar total, kg"), w: 12, fmt: FMT.kg, sum: true },
+        { h: L("Кофраж общо, m²", "Formwork total, m²"), w: 12, fmt: FMT.m2, sum: true }, ...stepCols(),
+        { h: L("Излят, % обем", "Poured, % volume"), w: 10, fmt: FMT.pct }, { h: L("Последно излят", "Last poured"), w: 12, fmt: FMT.date }],
+      data.pours.map((p) => [p.pour, p.types.join(", "), p.total, round(p.qty.volume, 3), round(p.qty.rebar, 1), round(p.qty.formwork, 2), ...stepVals(p.steps),
+        p.qty.volume ? p.steps.poured.qty / p.qty.volume : null, toDate(p.lastPoured)]), 1);
+    // 3) One row per pour object.
+    {
+      const cols = [{ h: L("Такт", "Pour"), w: 12 }, { h: L("Тип", "Type"), w: 28 }, { h: L("Елементи", "Parts"), w: 36 },
+        { h: L("Бетон, m³", "Concrete, m³"), w: 10, fmt: FMT.m3, sum: true }, { h: L("Армировка, kg", "Rebar, kg"), w: 11, fmt: FMT.kg, sum: true },
+        { h: L("Кофраж, m²", "Formwork, m²"), w: 10, fmt: FMT.m2, sum: true }, { h: L("Етап", "Stage"), w: 16 }];
+      for (const st of S.STEPS) cols.push({ h: `${stepName(st)} – ${L("дата", "date")}`, w: 12, fmt: FMT.date }, { h: L("От", "By"), w: 16 }, { h: L("Бележка", "Note"), w: 20 });
+      cols.push({ h: "IFC GUID", w: 24 }, { h: L("История", "History"), w: 60 });
+      const rows = objs.map((o) => {
+        const rec = state.records.get(o.guid) || {};
+        const r = [o.pour, o.type, o.parts, o.volume, o.rebar, o.formwork, stepName(S.stageOf(rec))];
+        for (const st of S.STEPS) r.push(rec[st.id] ? toDate(rec[`${st.id}_date`]) : null, rec[st.id] ? rec[`${st.id}_by`] : null, rec[st.id] ? rec[`${st.id}_note`] : null);
+        r.push(o.guid, rec.log ? String(rec.log).replace(/\r?\n/g, " | ") : null);
+        return r;
+      });
+      addSheet(L("Детайли", "Details"), qtyNote + L("Един ред на обект от такт.", "One row per pour object."), cols, rows, 1);
+    }
+
+    const buf = await wb.xlsx.writeBuffer();
+    const name = `pour-status_${String(project || "project").replace(/[\\/:*?"<>|]+/g, "_").trim()}_${S.today()}.xlsx`;
+    const url = URL.createObjectURL(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
     const a = document.createElement("a");
     a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
-    setStatus(`${lang === "bg" ? "Изтеглен" : "Downloaded"} ${name} (${rows.length} ${lang === "bg" ? "обекта" : "objects"})`);
+    setStatus(`${L("Изтеглен", "Downloaded")} ${name} (${objs.length} ${L("обекта", "objects")})`);
   }
 
   // ---------- rendering ----------
@@ -323,7 +438,7 @@
     });
   });
   $("btnFromViewer").onclick = () => guarded(selectionFromViewer);
-  $("btnCsv").onclick = () => guarded(exportCsv);
+  $("btnCsv").onclick = () => guarded(exportExcel);
   $("chkFollow").onchange = (e) => {
     state.follow = e.target.checked;
     try { localStorage.setItem("arsten.pourStatus.follow", state.follow ? "1" : "0"); } catch {}

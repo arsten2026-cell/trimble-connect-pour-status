@@ -201,6 +201,48 @@
     return "﻿" + lines.join("\r\n") + "\r\n";
   }
 
-  return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
-    stepState, summary, matchKey, orphans, toCsv };
+  /**
+   * Quantity each step "earns" for invoicing: formwork and stripping -> formwork area (sides + bottom, m²),
+   * rebar -> rebar weight (kg), poured -> concrete volume (m³).
+   */
+  const STEP_QTY = { formwork: "formwork", rebar: "rebar", poured: "volume", stripped: "formwork" };
+
+  /**
+   * Invoicing figures. Each step is counted in the month of its date (YYYY-MM), per pour type.
+   * @param objs [{pour, type, guid, volume, rebar, formwork}] (numbers); records Map guid -> props
+   * @returns {months: [{month, type, formwork:{n, qty}, rebar:{...}, poured:{...}, stripped:{...}}],
+   *           pours: [{pour, types, total, qty:{volume, rebar, formwork}, steps:{formwork:{n, qty}, ...}, lastPoured}]}
+   */
+  function invoiceData(objs, records) {
+    const num = (v) => (typeof v === "number" && isFinite(v) ? v : 0);
+    const empty = () => { const s = {}; for (const st of STEPS) s[st.id] = { n: 0, qty: 0 }; return s; };
+    const months = new Map(), pours = new Map();
+    for (const o of objs) {
+      const rec = records.get(o.guid) || {};
+      if (!pours.has(o.pour)) pours.set(o.pour, { pour: o.pour, types: new Set(), total: 0, qty: { volume: 0, rebar: 0, formwork: 0 }, steps: empty(), lastPoured: "" });
+      const p = pours.get(o.pour);
+      p.total++; if (o.type) p.types.add(o.type);
+      for (const q of ["volume", "rebar", "formwork"]) p.qty[q] += num(o[q]);
+      for (const st of STEPS) {
+        if (!rec[st.id]) continue;
+        const qty = num(o[STEP_QTY[st.id]]);
+        p.steps[st.id].n++; p.steps[st.id].qty += qty;
+        const date = String(rec[`${st.id}_date`] || "");
+        if (st.id === "poured" && date > p.lastPoured) p.lastPoured = date;
+        const month = /^\d{4}-\d{2}/.test(date) ? date.slice(0, 7) : "";
+        const k = month + "|" + (o.type || "");
+        if (!months.has(k)) months.set(k, Object.assign({ month, type: o.type || "" }, empty()));
+        const m = months.get(k);
+        m[st.id].n++; m[st.id].qty += qty;
+      }
+    }
+    const cmp = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
+    return {
+      months: [...months.values()].sort((a, b) => (a.month || "9999").localeCompare(b.month || "9999") || cmp(a.type, b.type)),
+      pours: [...pours.values()].map((p) => Object.assign(p, { types: [...p.types].sort(cmp) })),
+    };
+  }
+
+  return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
+    stepState, summary, matchKey, orphans, toCsv, invoiceData };
 });
