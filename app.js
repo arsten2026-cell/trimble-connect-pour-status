@@ -16,7 +16,9 @@
     nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
       "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
     markDone: ["Готово", "Mark done"], undo: ["Отмени", "Undo"], note: ["Бележка (по избор)", "Note (optional)"],
-    save: ["Запиши", "Save"], noteOnly: ["Само бележка", "Note only"],
+    save: ["Запиши", "Save"], without: ["Без", "Without"],
+    withoutTip: ["Етапът не важи за обекта (без кофраж / без армировка). Брои се за изпълнен, без количество за фактуриране.",
+      "The step does not apply to this object (no formwork / no rebar). Counts as covered, no quantity to invoice."], noteOnly: ["Само бележка", "Note only"],
     noteOnlyTip: ["Записва само бележката (датата и кой остават)", "Saves only the note (date and who stay)"],
     done: ["готови", "done"], select: ["Избери", "Select"], pour: ["Такт", "Pour"],
   };
@@ -172,7 +174,7 @@
     const has = (o) => (state.records.get(o.guid) || {})[stepId];
     // Partly done selection: "Готово" marks only the objects that do not have the step yet (the others keep theirs).
     const partly = objs.some(has) && !objs.every(has);
-    const targets = mode === "mark" ? (partly ? objs.filter((o) => !has(o)) : objs) : objs.filter(has);
+    const targets = mode === "mark" || mode === "na" ? (partly ? objs.filter((o) => !has(o)) : objs) : objs.filter(has);
     if (!targets.length) return setStatus(lang === "bg" ? "Няма обекти с този етап." : "No objects with this step.");
     if (mode === "note" && keepNote) return setStatus(lang === "bg" ? "Напишете бележка." : "Type a note.");
     let done = 0, failed = 0, firstErr = "";
@@ -182,7 +184,7 @@
       const old = cur || {};
       const next = mode === "undo" ? S.undoStep(cur, stepId, { by: state.user })
         : mode === "note" ? S.setNote(cur, stepId, { note, by: state.user })
-        : S.markStep(cur, stepId, {
+        : (mode === "na" ? S.markNa : S.markStep)(cur, stepId, {
           date: keepDate ? (old[stepId] && old[`${stepId}_date`]) || S.today() : dateBox.value,
           note: keepNote ? old[`${stepId}_note`] || "" : note,
           by: state.user, pour: o.group && o.group.numbered ? o.group.key : (o.group && o.group.label) || "", key: o.key });
@@ -199,7 +201,7 @@
       }
       setStatus(`${stepName(step)}: ${done}/${targets.length}…`);
     });
-    const verb = mode === "undo" ? L2("отменено", "undone") : mode === "note" ? L2("бележка записана", "note saved") : L2("записано", "saved");
+    const verb = mode === "undo" ? L2("отменено", "undone") : mode === "na" ? L2("отбелязано „без“", "marked without") : mode === "note" ? L2("бележка записана", "note saved") : L2("записано", "saved");
     setStatus(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : ""), failed > 0);
     render();
     if (state.coloured) await applyColours();
@@ -322,8 +324,8 @@
       return ws;
     }
 
-    const qtyNote = L("Количества от модела (Tekla): кофраж = страни + дъно (m²), армировка (kg), бетон (m³). ",
-      "Quantities from the model (Tekla): formwork = sides + bottom (m²), rebar (kg), concrete (m³). ");
+    const qtyNote = L("Количества от модела (Tekla): кофраж = страни + дъно (m²), армировка (kg), бетон (m³). Етапи „без“ не се броят и не се фактурират. ",
+      "Quantities from the model (Tekla): formwork = sides + bottom (m²), rebar (kg), concrete (m³). Steps marked \"without\" are not counted or invoiced. ");
     const stepCols = () => S.STEPS.flatMap((st) => [
       { h: `${stepName(st)}, ${L("бр.", "pcs")}`, w: 10, fmt: FMT.n, sum: true },
       { h: `${stepName(st)}, ${UNIT[st.id]}`, w: 13, fmt: fmtOf(UNIT[st.id]), sum: true }]);
@@ -340,9 +342,11 @@
       [{ h: L("Такт", "Pour"), w: 12 }, { h: L("Тип", "Type"), w: 30 }, { h: L("Обекти", "Objects"), w: 8, fmt: FMT.n, sum: true },
         { h: L("Бетон общо, m³", "Concrete total, m³"), w: 12, fmt: FMT.m3, sum: true }, { h: L("Армировка общо, kg", "Rebar total, kg"), w: 12, fmt: FMT.kg, sum: true },
         { h: L("Кофраж общо, m²", "Formwork total, m²"), w: 12, fmt: FMT.m2, sum: true }, ...stepCols(),
-        { h: L("Излят, % обем", "Poured, % volume"), w: 10, fmt: FMT.pct }, { h: L("Последно излят", "Last poured"), w: 12, fmt: FMT.date }],
+        { h: L("Излят, % обем", "Poured, % volume"), w: 10, fmt: FMT.pct }, { h: L("Последно излят", "Last poured"), w: 12, fmt: FMT.date },
+        { h: L("Без (бр.)", "Without (pcs)"), w: 28 }],
       data.pours.map((p) => [p.pour, p.types.join(", "), p.total, round(p.qty.volume, 3), round(p.qty.rebar, 1), round(p.qty.formwork, 2), ...stepVals(p.steps),
-        p.qty.volume ? p.steps.poured.qty / p.qty.volume : null, toDate(p.lastPoured)]), 1);
+        p.qty.volume ? p.steps.poured.qty / p.qty.volume : null, toDate(p.lastPoured),
+        S.STEPS.filter((st) => p.steps[st.id].na).map((st) => `${stepName(st)} ${p.steps[st.id].na}`).join(", ") || null]), 1);
     // 3) One row per pour object.
     {
       const cols = [{ h: L("Такт", "Pour"), w: 12 }, { h: L("Тип", "Type"), w: 28 }, { h: L("Елементи", "Parts"), w: 36 },
@@ -353,7 +357,7 @@
       const rows = objs.map((o) => {
         const rec = state.records.get(o.guid) || {};
         const r = [o.pour, o.type, o.parts, o.volume, o.rebar, o.formwork, stepName(S.stageOf(rec))];
-        for (const st of S.STEPS) r.push(rec[st.id] ? toDate(rec[`${st.id}_date`]) : null, rec[st.id] ? rec[`${st.id}_by`] : null, rec[st.id] ? rec[`${st.id}_note`] : null);
+        for (const st of S.STEPS) r.push(S.isNa(rec, st.id) ? L("без", "without") : rec[st.id] ? toDate(rec[`${st.id}_date`]) : null, rec[st.id] ? rec[`${st.id}_by`] : null, rec[st.id] ? rec[`${st.id}_note`] : null);
         r.push(o.guid, rec.log ? String(rec.log).replace(/\r?\n/g, " | ") : null);
         return r;
       });
@@ -394,7 +398,8 @@
     $("steps").innerHTML = S.STEPS.map((s, i) => {
       const st = S.stepState(state.records, guids, s.id);
       const v = S.stepValues(state.records, guids, s.id);
-      const label = !sel.length ? "" : st.state === "all" ? `✓ ${st.done}/${st.total}` : st.state === "mixed" ? `${st.done}/${st.total} ${t("done")}` : `0/${st.total}`;
+      const label = (!sel.length ? "" : st.state === "all" ? `✓ ${st.done}/${st.total}` : st.state === "mixed" ? `${st.done}/${st.total} ${t("done")}` : `0/${st.total}`)
+        + (st.na ? ` · ${t("without").toLowerCase()} ${st.na === st.total ? "" : st.na}`.trimEnd() : "");
       // Prefill with what is saved, so a correction or a note does not reset the date. Different values: empty = keep each one's.
       // Partly done: the boxes are for the objects not done yet (today, empty note); select the done ones to correct them.
       const partly = st.state === "mixed";
@@ -406,6 +411,7 @@
         ${st.dates.length ? `<div class="dates">${esc(st.dates.join(", "))}</div>` : ""}
         <div class="row"><input type="date" id="date_${s.id}" value="${esc(dateVal)}" title="${v.mixedDate ? esc(L2("различни дати – празно = без промяна", "different dates – empty = keep")) : ""}"><input type="text" id="note_${s.id}" data-mixed="${v.mixedNote ? 1 : 0}" value="${esc(v.note || "")}" placeholder="${esc(notePh)}"></div>
         <div class="row"><button class="small" data-act="mark" data-step="${s.id}" ${sel.length ? "" : "disabled"}>${esc(partly ? `${t("markDone")} (${st.total - st.done})` : st.done ? t("save") : t("markDone"))}</button><button
+          class="small secondary" data-act="na" data-step="${s.id}" ${sel.length ? "" : "disabled"} title="${esc(t("withoutTip"))}" ${s.na ? "" : "hidden"}>${esc(t("without"))}</button><button
           class="small secondary" data-act="note" data-step="${s.id}" ${st.done ? "" : "disabled"} title="${esc(t("noteOnlyTip"))}">${esc(t("noteOnly"))}</button><button
           class="small secondary" data-act="undo" data-step="${s.id}" ${st.done ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
     }).join("");
@@ -456,7 +462,7 @@
     if (!b) return;
     const act = b.dataset.act;
     guarded(async () => {
-      if (act === "mark" || act === "undo" || act === "note") await applyStep(b.dataset.step, act);
+      if (act === "mark" || act === "undo" || act === "note" || act === "na") await applyStep(b.dataset.step, act);
       else if (act === "pickPour") await selectPour(state.pours[+b.dataset.i]);
       else if (act === "reattach") await reattach(state.orphans[+b.dataset.i]);
     });

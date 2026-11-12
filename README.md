@@ -21,6 +21,9 @@ Static files only; the panel talks to Trimble Connect directly with the signed-i
   grey (on) or solid grey (off).
 - Partly done selection: "Готово (n)" marks only the n objects without the step (today by default); the
   others are untouched. Select the done ones to correct them.
+- "Без" (formwork, rebar, stripped): the step does not apply (dug footing without formwork, lean concrete without
+  rebar). Stored as the step done + `{step}_na: true`; counts as covered in the table but is not progress (stage/colour)
+  and earns no quantity in the Excel export. Formwork "Без" also sets stripped "Без" unless stripped is done.
 - "Само бележка" changes only the note (date and who stay; history: "note: …"). Empty clears the note.
 - A change that empties a field is written with `PsetClient.replace` (PATCH only merges).
 

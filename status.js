@@ -9,10 +9,10 @@
   "use strict";
 
   const STEPS = [
-    { id: "formwork", en: "Formwork done", bg: "Кофраж готов", colour: "#F2B705" },
-    { id: "rebar", en: "Rebar done", bg: "Армировка готова", colour: "#E37424" },
+    { id: "formwork", en: "Formwork done", bg: "Кофраж готов", colour: "#F2B705", na: true },
+    { id: "rebar", en: "Rebar done", bg: "Армировка готова", colour: "#E37424", na: true },
     { id: "poured", en: "Poured", bg: "Излят", colour: "#2E7D32" },
-    { id: "stripped", en: "Formwork removed", bg: "Декофриран", colour: "#1F4FD1" },
+    { id: "stripped", en: "Formwork removed", bg: "Декофриран", colour: "#1F4FD1", na: true },
   ];
   const NOT_STARTED = { id: "none", en: "Not started", bg: "Не е започнат", colour: "#9E9E9E" };
 
@@ -31,6 +31,8 @@
     STEPS.forEach((s, i) => {
       const n = `${i + 1} ${s.en} / ${s.bg}`;
       add(s.id, { type: "boolean" }, n);
+      // "Without": the step does not apply to this object (no formwork / no rebar). Counts as covered, earns nothing.
+      if (s.na) add(`${s.id}_na`, { type: "boolean" }, `${i + 1} Without / Без`);
       add(`${s.id}_date`, { type: "string", format: "date" }, `${i + 1} Date / Дата`);
       add(`${s.id}_by`, { type: "string" }, `${i + 1} By / От`);
       add(`${s.id}_note`, { type: "string" }, `${i + 1} Note / Бележка`);
@@ -61,11 +63,11 @@
     return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
   }
 
-  /** Index of the furthest step done (0 = not started, 1..4). */
+  /** Index of the furthest step actually done (0 = not started, 1..4); "without" steps do not count. */
   function stageIndex(rec) {
     if (!rec) return 0;
     let k = 0;
-    STEPS.forEach((s, i) => { if (rec[s.id]) k = i + 1; });
+    STEPS.forEach((s, i) => { if (rec[s.id] && !rec[`${s.id}_na`]) k = i + 1; });   // "without" steps are not progress
     return k;
   }
   const stageOf = (rec) => (stageIndex(rec) ? STEPS[stageIndex(rec) - 1] : NOT_STARTED);
@@ -88,8 +90,9 @@
     const step = STEPS.find((s) => s.id === stepId);
     if (!step) throw new Error("Unknown step " + stepId);
     const r = Object.assign({}, rec || {});
-    const was = !!r[stepId];
+    const was = !!r[stepId] && !r[`${stepId}_na`];
     r[stepId] = true;
+    if (r[`${stepId}_na`]) r[`${stepId}_na`] = false;
     r[`${stepId}_date`] = info.date || today();
     r[`${stepId}_by`] = info.by || "";
     r[`${stepId}_note`] = info.note || "";
@@ -107,6 +110,7 @@
     const r = Object.assign({}, rec || {});
     if (!r[stepId]) return r;
     r[stepId] = false;
+    if (r[`${stepId}_na`] != null) r[`${stepId}_na`] = null;
     r[`${stepId}_date`] = null;   // "" is rejected for date fields (422); null clears
     r[`${stepId}_by`] = null;
     r[`${stepId}_note`] = null;
@@ -114,6 +118,30 @@
     r.log = appendLog(r.log, logLine(`undone: ${step.en} by ${(info && info.by) || "?"}`, info && info.now));
     return r;
   }
+
+  /**
+   * Mark a step as "without" (does not apply: no formwork, no rebar). It counts as covered for progress but earns no
+   * quantity. Without formwork also means nothing to strip, so stripped is set to "without" too unless already done.
+   */
+  function markNa(rec, stepId, info) {
+    const step = STEPS.find((s) => s.id === stepId);
+    if (!step || !step.na) throw new Error("Step cannot be without: " + stepId);
+    const one = (r, id, st) => {
+      r[id] = true; r[`${id}_na`] = true;
+      r[`${id}_date`] = info.date || today();
+      r[`${id}_by`] = info.by || "";
+      r[`${id}_note`] = info.note || "";
+      r.log = appendLog(r.log, logLine(`without: ${st.en} ${r[`${id}_date`]} by ${info.by || "?"}${info.note ? " – " + info.note : ""}`, info.now));
+    };
+    const r = Object.assign({}, rec || {});
+    one(r, stepId, step);
+    if (stepId === "formwork" && !r.stripped) one(r, "stripped", STEPS.find((s) => s.id === "stripped"));
+    if (info.pour != null) r.pour = info.pour;
+    if (info.key != null) r.key = info.key;
+    r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`;
+    return r;
+  }
+  const isNa = (rec, stepId) => !!(rec && rec[stepId] && rec[`${stepId}_na`]);
 
   /** Change only the note of a step that is done (date and who stay). Empty note clears it. */
   function setNote(rec, stepId, info) {
@@ -150,14 +178,14 @@
    * @param records Map guid -> props; guids of the selected pour objects
    */
   function stepState(records, guids, stepId) {
-    let done = 0;
+    let done = 0, na = 0;
     const dates = new Set();
     for (const g of guids) {
       const r = records.get(g);
-      if (r && r[stepId]) { done++; if (r[`${stepId}_date`]) dates.add(r[`${stepId}_date`]); }
+      if (r && r[stepId]) { done++; if (r[`${stepId}_na`]) na++; else if (r[`${stepId}_date`]) dates.add(r[`${stepId}_date`]); }
     }
     const total = guids.length;
-    return { done, total, dates: [...dates].sort(), state: !total || !done ? "none" : done === total ? "all" : "mixed" };
+    return { done, na, total, dates: [...dates].sort(), state: !total || !done ? "none" : done === total ? "all" : "mixed" };
   }
 
   /** Per pour number: {key, label, total, steps:{formwork: n, ...}} in pour order. */
@@ -224,7 +252,7 @@
     for (const r of rows) {
       const rec = records.get(r.guid) || {};
       const line = [r.pour, r.type, r.volume, r.parts, stageOf(rec)[bg ? "bg" : "en"]];
-      for (const st of STEPS) line.push(rec[st.id] ? yes : no, rec[st.id] ? rec[`${st.id}_date`] : "", rec[st.id] ? rec[`${st.id}_by`] : "", rec[st.id] ? rec[`${st.id}_note`] : "");
+      for (const st of STEPS) line.push(isNa(rec, st.id) ? (bg ? "Без" : "Without") : rec[st.id] ? yes : no, rec[st.id] ? rec[`${st.id}_date`] : "", rec[st.id] ? rec[`${st.id}_by`] : "", rec[st.id] ? rec[`${st.id}_note`] : "");
       line.push(r.guid, rec.log);
       lines.push(line.map(cell).join(";"));
     }
@@ -245,7 +273,7 @@
    */
   function invoiceData(objs, records) {
     const num = (v) => (typeof v === "number" && isFinite(v) ? v : 0);
-    const empty = () => { const s = {}; for (const st of STEPS) s[st.id] = { n: 0, qty: 0 }; return s; };
+    const empty = () => { const s = {}; for (const st of STEPS) s[st.id] = { n: 0, qty: 0, na: 0 }; return s; };
     const months = new Map(), pours = new Map();
     for (const o of objs) {
       const rec = records.get(o.guid) || {};
@@ -255,6 +283,7 @@
       for (const q of ["volume", "rebar", "formwork"]) p.qty[q] += num(o[q]);
       for (const st of STEPS) {
         if (!rec[st.id]) continue;
+        if (rec[`${st.id}_na`]) { p.steps[st.id].na++; continue; }   // "without": nothing to invoice
         const qty = num(o[STEP_QTY[st.id]]);
         p.steps[st.id].n++; p.steps[st.id].qty += qty;
         const date = String(rec[`${st.id}_date`] || "");
@@ -274,5 +303,5 @@
   }
 
   return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
-    setNote, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
+    markNa, isNa, setNote, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
 });
