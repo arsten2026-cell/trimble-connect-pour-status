@@ -13,6 +13,13 @@ Install: project → Settings → Apps & Capabilities → + Add Custom →
 
 Static files only; the panel talks to Trimble Connect directly with the signed-in user's access.
 
+## Corrections and notes
+- With objects selected that already have a step, its date and note boxes show the saved values; the button reads
+  "Запиши" and overwrites (history: "corrected"). Different values across the selection: the box is empty and
+  empty means keep each object's own value.
+- "Само бележка" changes only the note (date and who stay; history: "note: …"). Empty clears the note.
+- A change that empties a field is written with `PsetClient.replace` (PATCH only merges).
+
 ## Excel export (for invoicing)
 "Експорт Excel" next to the Pours heading downloads `pour-status_{project}_{date}.xlsx` (ExcelJS 4.4.0, loaded from
 jsDelivr with SRI only when the button is pressed). Sheets:

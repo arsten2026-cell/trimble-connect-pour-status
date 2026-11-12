@@ -115,6 +115,36 @@
     return r;
   }
 
+  /** Change only the note of a step that is done (date and who stay). Empty note clears it. */
+  function setNote(rec, stepId, info) {
+    const step = STEPS.find((s) => s.id === stepId);
+    if (!step) throw new Error("Unknown step " + stepId);
+    const r = Object.assign({}, rec || {});
+    if (!r[stepId]) return r;
+    const note = String((info && info.note) || "").trim();
+    r[`${stepId}_note`] = note || null;
+    r.log = appendLog(r.log, logLine(`note: ${step.en}${note ? " – " + note : " (cleared)"} by ${(info && info.by) || "?"}`, info && info.now));
+    return r;
+  }
+
+  /** True when a field that had a value is now empty: PATCH only merges, so the pset has to be replaced. */
+  function clearsField(cur, next) {
+    if (!cur) return false;
+    const empty = (v) => v == null || v === "";
+    return Object.keys(cur).some((k) => !empty(cur[k]) && empty(next[k]));
+  }
+
+  /** Saved date and note of a step over the selected objects that have it done: the value if all agree, else mixed. */
+  function stepValues(records, guids, stepId) {
+    const dates = new Set(), notes = new Set();
+    for (const g of guids) {
+      const r = records.get(g);
+      if (r && r[stepId]) { dates.add(r[`${stepId}_date`] || ""); notes.add(r[`${stepId}_note`] || ""); }
+    }
+    return { any: dates.size > 0, date: dates.size === 1 ? [...dates][0] : null, note: notes.size === 1 ? [...notes][0] : null,
+      mixedDate: dates.size > 1, mixedNote: notes.size > 1 };
+  }
+
   /**
    * State of a selection for one step: {done, total, dates:Set} -> "all", "none" or "mixed".
    * @param records Map guid -> props; guids of the selected pour objects
@@ -244,5 +274,5 @@
   }
 
   return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
-    stepState, summary, matchKey, orphans, toCsv, invoiceData };
+    setNote, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
 });

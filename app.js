@@ -16,10 +16,13 @@
     nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
       "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
     markDone: ["Готово", "Mark done"], undo: ["Отмени", "Undo"], note: ["Бележка (по избор)", "Note (optional)"],
+    save: ["Запиши", "Save"], noteOnly: ["Само бележка", "Note only"],
+    noteOnlyTip: ["Записва само бележката (датата и кой остават)", "Saves only the note (date and who stay)"],
     done: ["готови", "done"], select: ["Избери", "Select"], pour: ["Такт", "Pour"],
   };
   let lang = (() => { try { return localStorage.getItem("arsten.pourStatus.lang") || "bg"; } catch { return "bg"; } })();
   const t = (k) => (T[k] ? T[k][lang === "bg" ? 0 : 1] : k);
+  const L2 = (b, e) => (lang === "bg" ? b : e);
   const stepName = (s) => (lang === "bg" ? s.bg : s.en);
 
   const state = {
@@ -156,23 +159,33 @@
   }
 
   // ---------- writing steps ----------
-  async function applyStep(stepId, undo) {
+  // mode: "mark" (done / correct), "undo", or "note" (change only the note of objects that have the step).
+  // Empty date or note boxes mean "keep what each object has" when the selection had different values (mixed).
+  async function applyStep(stepId, mode) {
     const step = S.STEPS.find((s) => s.id === stepId);
-    const date = $("date_" + stepId).value || S.today();
-    const note = $("note_" + stepId).value.trim();
+    const dateBox = $("date_" + stepId), noteBox = $("note_" + stepId);
+    const keepDate = !dateBox.value, keepNote = !noteBox.value.trim() && noteBox.dataset.mixed === "1";
+    const note = noteBox.value.trim();
     const objs = state.sel.slice();
     if (!objs.length) return;
-    const targets = undo ? objs.filter((o) => (state.records.get(o.guid) || {})[stepId]) : objs;
-    if (!targets.length) return setStatus(lang === "bg" ? "Няма какво да се отмени." : "Nothing to undo.");
+    const has = (o) => (state.records.get(o.guid) || {})[stepId];
+    const targets = mode === "mark" ? objs : objs.filter(has);
+    if (!targets.length) return setStatus(lang === "bg" ? "Няма обекти с този етап." : "No objects with this step.");
+    if (mode === "note" && keepNote) return setStatus(lang === "bg" ? "Напишете бележка." : "Type a note.");
     let done = 0, failed = 0, firstErr = "";
     setStatus(`${stepName(step)}: 0/${targets.length}…`);
     await pool(targets, 6, async (o) => {
       const cur = state.records.get(o.guid) || null;
-      const next = undo
-        ? S.undoStep(cur, stepId, { by: state.user })
-        : S.markStep(cur, stepId, { date, by: state.user, note, pour: o.group && o.group.numbered ? o.group.key : (o.group && o.group.label) || "", key: o.key });
+      const old = cur || {};
+      const next = mode === "undo" ? S.undoStep(cur, stepId, { by: state.user })
+        : mode === "note" ? S.setNote(cur, stepId, { note, by: state.user })
+        : S.markStep(cur, stepId, {
+          date: keepDate ? (old[stepId] && old[`${stepId}_date`]) || S.today() : dateBox.value,
+          note: keepNote ? old[`${stepId}_note`] || "" : note,
+          by: state.user, pour: o.group && o.group.numbered ? o.group.key : (o.group && o.group.label) || "", key: o.key });
       try {
-        await (undo ? state.client.replace : state.client.write).call(state.client, state.lib.id, state.defId, S.entityLink(o.guid), next);
+        const replace = mode === "undo" || S.clearsField(cur, next);
+        await (replace ? state.client.replace : state.client.write).call(state.client, state.lib.id, state.defId, S.entityLink(o.guid), next);
         state.records.set(o.guid, next);
         done++;
       } catch (e) {
@@ -183,8 +196,8 @@
       }
       setStatus(`${stepName(step)}: ${done}/${targets.length}…`);
     });
-    $("note_" + stepId).value = "";
-    setStatus(`${stepName(step)} ${undo ? (lang === "bg" ? "отменено" : "undone") : (lang === "bg" ? "записано" : "saved")}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : ""), failed > 0);
+    const verb = mode === "undo" ? L2("отменено", "undone") : mode === "note" ? L2("бележка записана", "note saved") : L2("записано", "saved");
+    setStatus(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : ""), failed > 0);
     render();
     if (state.coloured) await applyColours();
   }
@@ -376,12 +389,17 @@
     const guids = sel.map((o) => o.guid);
     $("steps").innerHTML = S.STEPS.map((s, i) => {
       const st = S.stepState(state.records, guids, s.id);
+      const v = S.stepValues(state.records, guids, s.id);
       const label = !sel.length ? "" : st.state === "all" ? `✓ ${st.done}/${st.total}` : st.state === "mixed" ? `${st.done}/${st.total} ${t("done")}` : `0/${st.total}`;
+      // Prefill with what is saved, so a correction or a note does not reset the date. Different values: empty = keep each one's.
+      const dateVal = v.mixedDate ? "" : v.date || S.today();
+      const notePh = v.mixedNote ? L2("различни бележки – празно = без промяна", "different notes – empty = keep") : t("note");
       return `<div class="step" style="--c:${s.colour}">
         <div class="hd"><span class="nm">${i + 1}. ${esc(stepName(s))}</span><span class="st ${st.state}">${label}</span></div>
         ${st.dates.length ? `<div class="dates">${esc(st.dates.join(", "))}</div>` : ""}
-        <div class="row"><input type="date" id="date_${s.id}" value="${S.today()}"><input type="text" id="note_${s.id}" placeholder="${esc(t("note"))}"></div>
-        <div class="row"><button class="small" data-act="mark" data-step="${s.id}" ${sel.length ? "" : "disabled"}>${esc(t("markDone"))}</button><button
+        <div class="row"><input type="date" id="date_${s.id}" value="${esc(dateVal)}" title="${v.mixedDate ? esc(L2("различни дати – празно = без промяна", "different dates – empty = keep")) : ""}"><input type="text" id="note_${s.id}" data-mixed="${v.mixedNote ? 1 : 0}" value="${esc(v.note || "")}" placeholder="${esc(notePh)}"></div>
+        <div class="row"><button class="small" data-act="mark" data-step="${s.id}" ${sel.length ? "" : "disabled"}>${esc(st.done ? t("save") : t("markDone"))}</button><button
+          class="small secondary" data-act="note" data-step="${s.id}" ${st.done ? "" : "disabled"} title="${esc(t("noteOnlyTip"))}">${esc(t("noteOnly"))}</button><button
           class="small secondary" data-act="undo" data-step="${s.id}" ${st.done ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
     }).join("");
     // legend
@@ -431,8 +449,7 @@
     if (!b) return;
     const act = b.dataset.act;
     guarded(async () => {
-      if (act === "mark") await applyStep(b.dataset.step, false);
-      else if (act === "undo") await applyStep(b.dataset.step, true);
+      if (act === "mark" || act === "undo" || act === "note") await applyStep(b.dataset.step, act);
       else if (act === "pickPour") await selectPour(state.pours[+b.dataset.i]);
       else if (act === "reattach") await reattach(state.orphans[+b.dataset.i]);
     });
