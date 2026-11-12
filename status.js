@@ -37,6 +37,12 @@
       add(`${s.id}_by`, { type: "string" }, `${i + 1} By / От`);
       add(`${s.id}_note`, { type: "string" }, `${i + 1} Note / Бележка`);
     });
+    // Quantity each step earned when it was marked (frozen for invoicing), and the object's outline and volume at
+    // marking (to recognise pieces when Tekla splits the pour later). Strings: plain numbers / "minx,miny,minz,maxx,maxy,maxz".
+    STEPS.forEach((s, i) => add(`${s.id}_qty`, { type: "string" }, `${i + 1} Quantity / Количество`));
+    add("snap_bbox", { type: "string" }, "Outline at marking / Габарит при отбелязване");
+    add("snap_volume", { type: "string" }, "Volume at marking / Обем при отбелязване");
+    add("split_from", { type: "string" }, "Split from / Разделен от");
     add("pour", { type: "string" }, "Pour / Такт");
     add("key", { type: "string" }, "Match key / Ключ");
     add("log", { type: "string" }, "History / История");   // "long-text" format is rejected by pset-api (422, 2026-11); length capped by LOG_MAX in code
@@ -61,6 +67,22 @@
   function today(d) {
     const x = d || new Date();
     return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
+  }
+
+  const numText = (v) => String(Math.round(v * 1000) / 1000);
+  const bboxText = (b) => (b ? [b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z].map(numText).join(",") : "");
+  function bboxOf(v) {
+    if (!v) return null;
+    if (typeof v === "object") return v.min && v.max ? v : null;
+    const n = String(v).split(",").map(Number);
+    return n.length === 6 && n.every(isFinite) ? { min: { x: n[0], y: n[1], z: n[2] }, max: { x: n[3], y: n[4], z: n[5] } } : null;
+  }
+  /** Outline and volume of the object the first time it gets a status (info.snap = {bbox, volume}). */
+  function snapshot(r, info) {
+    const sn = info && info.snap;
+    if (!sn || r.snap_bbox) return;
+    if (sn.bbox) r.snap_bbox = bboxText(sn.bbox);
+    if (sn.volume != null && isFinite(sn.volume)) r.snap_volume = numText(sn.volume);
   }
 
   /** Index of the furthest step done (0 = not started, 1..4). */
@@ -101,6 +123,8 @@
     r[`${stepId}_date`] = info.date || today();
     r[`${stepId}_by`] = info.by || "";
     r[`${stepId}_note`] = info.note || "";
+    if (info.qty != null && isFinite(info.qty) && (!was || r[`${stepId}_qty`] == null)) r[`${stepId}_qty`] = numText(info.qty);   // a correction keeps the frozen quantity
+    snapshot(r, info);
     if (info.pour != null) r.pour = info.pour;
     if (info.key != null) r.key = info.key;
     r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`;
@@ -119,6 +143,7 @@
     r[`${stepId}_date`] = null;   // "" is rejected for date fields (422); null clears
     r[`${stepId}_by`] = null;
     r[`${stepId}_note`] = null;
+    if (r[`${stepId}_qty`] != null) r[`${stepId}_qty`] = null;
     r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`;
     r.log = appendLog(r.log, logLine(`undone: ${step.en} by ${(info && info.by) || "?"}`, info && info.now));
     return r;
@@ -140,6 +165,7 @@
     };
     const r = Object.assign({}, rec || {});
     one(r, stepId, step);
+    snapshot(r, info);
     if (stepId === "formwork" && !r.stripped) one(r, "stripped", STEPS.find((s) => s.id === "stripped"));
     if (info.pour != null) r.pour = info.pour;
     if (info.key != null) r.key = info.key;
@@ -289,7 +315,8 @@
       for (const st of STEPS) {
         if (!rec[st.id]) continue;
         if (rec[`${st.id}_na`]) { p.steps[st.id].na++; continue; }   // "without": nothing to invoice
-        const qty = num(o[STEP_QTY[st.id]]);
+        const frozen = parseFloat(rec[`${st.id}_qty`]);
+        const qty = isFinite(frozen) ? frozen : num(o[STEP_QTY[st.id]]);   // frozen at marking, else the model's
         p.steps[st.id].n++; p.steps[st.id].qty += qty;
         const date = String(rec[`${st.id}_date`] || "");
         if (st.id === "poured" && date > p.lastPoured) p.lastPoured = date;
@@ -307,6 +334,95 @@
     };
   }
 
+  // ---------- pour split by Tekla (pour break added after formwork/rebar were done) ----------
+  const AXES = ["x", "y", "z"];
+  const maxDim = (b) => Math.max(...AXES.map((a) => b.max[a] - b.min[a]));
+  // Tolerance per axis: 1% of the reference box's size along that axis (so a thin slab is not "inside" with a whole layer below).
+  const tolOf = (b, a) => 0.01 * (b.max[a] - b.min[a]) + 1e-9 * maxDim(b);
+  const inside = (c, p) => AXES.every((a) => c.min[a] >= p.min[a] - tolOf(p, a) && c.max[a] <= p.max[a] + tolOf(p, a));
+  const overlaps = (c, p) => AXES.every((a) => Math.min(c.max[a], p.max[a]) - Math.max(c.min[a], p.min[a]) > tolOf(p, a));
+  const boxVol = (b) => AXES.reduce((v, a) => v * Math.max(0, b.max[a] - b.min[a]), 1);
+  const overlapShare = (c, p) => { const v = boxVol(c); return v > 0 ? AXES.reduce((t, a) => t * Math.max(0, Math.min(c.max[a], p.max[a]) - Math.max(c.min[a], p.min[a])), 1) / v : 0; };
+  const touches = (c, p) => AXES.every((a) => Math.min(c.max[a], p.max[a]) - Math.max(c.min[a], p.min[a]) >= -tolOf(p, a));
+  const partTokens = (s) => new Set(String(s || "").split(";").map((x) => x.replace(/\s+x\d+\s*$/, "").trim()).filter(Boolean));
+  const INHERIT = ["formwork", "rebar"];   // what a piece of a split pour inherits; never poured/stripped
+  const hasSteps = (r) => !!r && STEPS.some((s) => r[s.id]);
+
+  /**
+   * Pours that Tekla split after formwork/rebar were marked: for each such status, the new objects (no status) that are
+   * pieces of it. With the outline saved at marking: pieces fully inside it are children, pieces only overlapping it are
+   * "partial" (offered unticked); the volumes of kept + children should add up to the volume at marking. Records from
+   * before outlines were saved: pieces with the same pour number that touch the kept object and share parts (less sure).
+   * @param objects [{guid, pour, parts, bbox, volume, key}] all pour objects in the model
+   */
+  function splits(records, objects) {
+    const byGuid = new Map(objects.map((o) => [o.guid, o]));
+    const free = objects.filter((o) => o.bbox && !hasSteps(records.get(o.guid)));
+    const out = [];
+    for (const [guid, r] of records) {
+      const steps = INHERIT.filter((id) => r[id]);
+      if (!steps.length || r.poured) continue;
+      const cur = byGuid.get(guid) || null;
+      const snap = bboxOf(r.snap_bbox), snapVol = parseFloat(r.snap_volume);
+      let children = [], partial = [], exact = false, sumVol = null, volOk = null;
+      // A piece keeps (some of) the original's parts: a split wall is still wall. Anchors, lean concrete etc. inside the
+      // outline are other pour objects, not pieces. Older exports without Parts: no filter.
+      const [, oldParts, oldCentre] = String(r.key || "").split("|");
+      const tokens = partTokens(oldParts);
+      const sameParts = (o) => !tokens.size || [...partTokens(o.parts)].some((tk) => tokens.has(tk));
+      if (snap) {
+        const shrunk = cur && ((isFinite(snapVol) && cur.volume != null && cur.volume < snapVol * 0.99) || (cur.bbox && !inside(snap, cur.bbox)));
+        if (cur && !shrunk) continue;
+        for (const o of free) {
+          if (o.guid === guid || !sameParts(o)) continue;
+          if (inside(o.bbox, snap)) children.push(o);
+          else if (overlaps(o.bbox, snap) && overlapShare(o.bbox, snap) >= 0.2) partial.push(o);
+        }
+        exact = true;
+        if (isFinite(snapVol)) {
+          sumVol = ((cur && cur.volume) || 0) + children.reduce((t, o) => t + (o.volume || 0), 0);
+          volOk = Math.abs(sumVol - snapVol) <= Math.max(0.02 * snapVol, 0.001);
+        }
+      } else {
+        if (!cur || !cur.bbox || !r.key) continue;
+        const [, , newCentre] = String(cur.key || "").split("|");
+        if (oldCentre === newCentre || !tokens.size) continue;   // geometry unchanged (a renumber alone is not a split)
+        children = free.filter((o) => o.guid !== guid && o.pour === r.pour && touches(o.bbox, cur.bbox) && sameParts(o));
+      }
+      if (children.length || partial.length) out.push({ guid, record: r, present: !!cur, exact, steps, children, partial, sumVol, snapVol: isFinite(snapVol) ? snapVol : null, volOk });
+    }
+    return out;
+  }
+
+  /** Status for a piece of a split pour: the parent's formwork/rebar (date, who, note, "without"). Quantity already
+   *  frozen on the parent is not counted again (0); otherwise the piece's own model quantity applies. */
+  function inherit(parent, parentGuid, info) {
+    const r = {};
+    for (const id of INHERIT) {
+      if (!parent[id]) continue;
+      for (const f of ["", "_na", "_date", "_by", "_note"]) if (parent[id + f] != null && parent[id + f] !== "") r[id + f] = parent[id + f];
+      if (parent[`${id}_qty`] != null) r[`${id}_qty`] = "0";
+      r.log = appendLog(r.log, logLine(`inherited: ${STEPS.find((s) => s.id === id).en} ${parent[`${id}_date`] || ""} (${parent[`${id}_by`] || "?"}) from ${parentGuid} – pour break, by ${info.by || "?"}`, info.now));
+    }
+    r.split_from = parentGuid;
+    snapshot(r, info);
+    if (info.pour != null) r.pour = info.pour;
+    if (info.key != null) r.key = info.key;
+    r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`;
+    return r;
+  }
+
+  /** After a split was handled (or dismissed): the parent's outline/volume/key become the current ones, with a log line. */
+  function splitDone(parent, info) {
+    const r = Object.assign({}, parent);
+    if (info.snap && info.snap.bbox) r.snap_bbox = bboxText(info.snap.bbox);
+    if (info.snap && info.snap.volume != null && isFinite(info.snap.volume)) r.snap_volume = numText(info.snap.volume);
+    if (info.key != null) r.key = info.key;
+    if (info.pour != null) r.pour = info.pour;
+    r.log = appendLog(r.log, logLine(info.pieces ? `split: ${info.pieces} new piece(s) got formwork/rebar, by ${info.by || "?"}` : `split checked, nothing passed on, by ${info.by || "?"}`, info.now));
+    return r;
+  }
+
   return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
-    markNa, isNa, setNote, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
+    markNa, isNa, setNote, splits, inherit, splitDone, bboxText, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
 });

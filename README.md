@@ -27,6 +27,20 @@ Static files only; the panel talks to Trimble Connect directly with the signed-i
 - "Само бележка" changes only the note (date and who stay; history: "note: …"). Empty clears the note.
 - A change that empties a field is written with `PsetClient.replace` (PATCH only merges).
 
+## Pour split by Tekla (pour break added after formwork/rebar)
+Tested in 1028 (2026-11-12): Tekla keeps the original GUID for one piece (status stays, quantities shrink) and gives
+every other piece a new GUID (no status). No parent link is exported, so the panel works it out:
+- When a step is marked, the record also saves the step's quantity (`{step}_qty`, frozen for invoicing) and the
+  object's outline and volume (`snap_bbox`, `snap_volume`), once.
+- `S.splits`: a status with formwork/rebar (not poured) whose object shrank or disappeared; new objects without status
+  fully inside the saved outline are pieces (pour number may differ), objects with at least 20 % of their box inside
+  are "partial" (offered unticked). Pieces must share a part name with the original (`key`), so anchors or lean
+  concrete inside the outline are not taken. Kept + pieces volume is checked against `snap_volume` (2 %).
+- Records from before outlines were saved: pieces with the same pour number, touching the kept object, sharing parts.
+- Panel section "Разделени тактове": ticked pieces, volume check, Прехвърли (pieces get formwork/rebar with the
+  parent's date/who, `split_from`, quantity 0 when the parent's quantity is frozen), Покажи, Не (keep as is).
+- Excel uses the frozen quantity of each step; Детайли has "Записано ≠ модел" where it differs from the model now.
+
 ## Excel export (for invoicing)
 "Експорт Excel" next to the Pours heading downloads `pour-status_{project}_{date}.xlsx` (ExcelJS 4.4.0, loaded from
 jsDelivr with SRI only when the button is pressed). Sheets:

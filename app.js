@@ -151,15 +151,25 @@
     setStatus("");
     render();
   }
-  async function selectPour(g) {
-    state.sel = g.objects.slice();
+  async function selectPour(g) { await selectObjects(g.objects); }
+  async function selectObjects(objs) {
+    state.sel = objs.slice();
     const byModel = new Map();
-    for (const o of g.objects) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
+    for (const o of objs) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
     const sel = { modelObjectIds: [...byModel].map(([modelId, objectRuntimeIds]) => ({ modelId, objectRuntimeIds })) };
     await state.api.viewer.setSelection(sel, "set");
     await state.api.viewer.setCamera(sel, { animationTime: 500 });
     render();
   }
+
+  // Model quantities of a pour object (Tekla pour export): concrete m³, rebar kg, formwork m² (sides + bottom).
+  function liveQty(o) {
+    const p = o.props || {};
+    const fw = (toNum(p[C.P.fwSides]) || 0) + (toNum(p[C.P.fwBottom]) || 0);
+    return { volume: toNum(p[C.P.volume]), rebar: toNum(p[C.P.rebar]), formwork: fw || (toNum(p[C.P.fwSides]) == null && toNum(p[C.P.fwBottom]) == null ? null : 0) };
+  }
+  const pourOf = (o) => (o.group && o.group.numbered ? o.group.key : (o.group && o.group.label) || "");
+  const snapOf = (o) => ({ bbox: o.bbox || null, volume: liveQty(o).volume });
 
   // ---------- writing steps ----------
   // mode: "mark" (done / correct), "undo", or "note" (change only the note of objects that have the step).
@@ -187,7 +197,7 @@
         : (mode === "na" ? S.markNa : S.markStep)(cur, stepId, {
           date: keepDate ? (old[stepId] && old[`${stepId}_date`]) || S.today() : dateBox.value,
           note: keepNote ? old[`${stepId}_note`] || "" : note,
-          by: state.user, pour: o.group && o.group.numbered ? o.group.key : (o.group && o.group.label) || "", key: o.key });
+          by: state.user, pour: pourOf(o), key: o.key, qty: liveQty(o)[S.STEP_QTY[stepId]], snap: snapOf(o) });
       try {
         const replace = mode === "undo" || S.clearsField(cur, next);
         await (replace ? state.client.replace : state.client.write).call(state.client, state.lib.id, state.defId, S.entityLink(o.guid), next);
@@ -324,8 +334,8 @@
       return ws;
     }
 
-    const qtyNote = L("Количества от модела (Tekla): кофраж = страни + дъно (m²), армировка (kg), бетон (m³). Етапи „без“ не се броят и не се фактурират. ",
-      "Quantities from the model (Tekla): formwork = sides + bottom (m²), rebar (kg), concrete (m³). Steps marked \"without\" are not counted or invoiced. ");
+    const qtyNote = L("Количества от модела (Tekla): кофраж = страни + дъно (m²), армировка (kg), бетон (m³). Етапи „без“ не се броят и не се фактурират. Всеки етап е с количеството, записано при отбелязването му. ",
+      "Quantities from the model (Tekla): formwork = sides + bottom (m²), rebar (kg), concrete (m³). Steps marked \"without\" are not counted or invoiced. Each step uses the quantity saved when it was marked. ");
     const stepCols = () => S.STEPS.flatMap((st) => [
       { h: `${stepName(st)}, ${L("бр.", "pcs")}`, w: 10, fmt: FMT.n, sum: true },
       { h: `${stepName(st)}, ${UNIT[st.id]}`, w: 13, fmt: fmtOf(UNIT[st.id]), sum: true }]);
@@ -353,12 +363,17 @@
         { h: L("Бетон, m³", "Concrete, m³"), w: 10, fmt: FMT.m3, sum: true }, { h: L("Армировка, kg", "Rebar, kg"), w: 11, fmt: FMT.kg, sum: true },
         { h: L("Кофраж, m²", "Formwork, m²"), w: 10, fmt: FMT.m2, sum: true }, { h: L("Етап", "Stage"), w: 16 }];
       for (const st of S.STEPS) cols.push({ h: `${stepName(st)} – ${L("дата", "date")}`, w: 12, fmt: FMT.date }, { h: L("От", "By"), w: 16 }, { h: L("Бележка", "Note"), w: 20 });
-      cols.push({ h: "IFC GUID", w: 24 }, { h: L("История", "History"), w: 60 });
+      cols.push({ h: L("Записано ≠ модел", "Saved ≠ model"), w: 30 }, { h: "IFC GUID", w: 24 }, { h: L("История", "History"), w: 60 });
       const rows = objs.map((o) => {
         const rec = state.records.get(o.guid) || {};
         const r = [o.pour, o.type, o.parts, o.volume, o.rebar, o.formwork, stepName(S.stageOf(rec))];
         for (const st of S.STEPS) r.push(S.isNa(rec, st.id) ? L("без", "without") : rec[st.id] ? toDate(rec[`${st.id}_date`]) : null, rec[st.id] ? rec[`${st.id}_by`] : null, rec[st.id] ? rec[`${st.id}_note`] : null);
-        r.push(o.guid, rec.log ? String(rec.log).replace(/\r?\n/g, " | ") : null);
+        // Frozen (invoiced) quantity that no longer matches the model, e.g. after a pour break.
+        const diff = S.STEPS.filter((st) => {
+          const fz = parseFloat(rec[`${st.id}_qty`]), live = o[S.STEP_QTY[st.id]];
+          return rec[st.id] && !rec[`${st.id}_na`] && isFinite(fz) && fz > 0 && live != null && Math.abs(fz - live) > Math.max(0.01 * fz, 0.01);
+        }).map((st) => `${stepName(st)}: ${round(parseFloat(rec[`${st.id}_qty`]), 2)} → ${round(o[S.STEP_QTY[st.id]], 2)}`).join("; ");
+        r.push(diff || null, o.guid, rec.log ? String(rec.log).replace(/\r?\n/g, " | ") : null);
         return r;
       });
       addSheet(L("Детайли", "Details"), qtyNote + L("Един ред на обект от такт.", "One row per pour object."), cols, rows, 1);
@@ -378,7 +393,7 @@
     $("title").textContent = t("title");
     $("hSel").textContent = t("selection"); $("hSteps").textContent = t("steps"); $("hView").textContent = t("view");
     $("btnCsv").textContent = t("csv");
-    $("hSummary").textContent = t("pours"); $("hOrphans").textContent = t("orphans");
+    $("hSummary").textContent = t("pours"); $("hOrphans").textContent = t("orphans"); $("hSplits").textContent = L2("Разделени тактове", "Split pours");
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
     $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
     $("lblColour").textContent = t("colour");
@@ -426,9 +441,33 @@
         return `<td class="n ${n === 0 ? "zero" : n === r.total ? "full" : "part"}">${n}/${r.total}</td>`;
       }).join("")}<td><button class="small secondary" data-act="pickPour" data-i="${i}">${esc(t("select"))}</button></td></tr>`).join("")
       : `<tr><td colspan="6" class="empty">No pours.</td></tr>`;
+    // pours split by Tekla after formwork/rebar
+    const splitObjs = state.objects.map((o) => Object.assign({ guid: o.guid, pour: pourOf(o), parts: (o.props || {})[C.P.parts] || "", bbox: o.bbox, key: o.key, obj: o }, { volume: liveQty(o).volume }));
+    const sp = S.splits(state.records, splitObjs);
+    state.splits = sp;
+    $("splitBox").hidden = !sp.length;
+    if (sp.length) {
+      $("splitText").textContent = L2("Тези тактове са разделени в Tekla след като кофражът/армировката им са отбелязани. Новите части могат да наследят статуса.",
+        "These pours were split in Tekla after their formwork/rebar was marked. The new pieces can take over the status.");
+      const f3 = (v) => (v == null ? "?" : (Math.round(v * 100) / 100).toLocaleString(lang === "bg" ? "bg-BG" : "en-GB"));
+      $("splitRows").innerHTML = sp.map((x, i) => {
+        const what = x.steps.map((id) => `${stepName(S.STEPS.find((s) => s.id === id))}${x.record[id + "_na"] ? " (" + t("without").toLowerCase() + ")" : ""} ${x.record[id + "_date"] || ""}`).join(", ");
+        const vol = x.snapVol == null ? `<span class="sub">${L2("няма записан обем – проверете частите", "no saved volume – check the pieces")}</span>`
+          : `${L2("обем", "volume")} ${f3(x.snapVol)} m³ ${x.volOk ? "= " : "≠ "}${f3(x.sumVol)} ${x.volOk ? "✓" : "⚠"}`;
+        const row = (o, k, ticked, tag) => `<label class="chk"><input type="checkbox" data-split="${i}" data-k="${k}" ${ticked ? "checked" : ""}> ${esc(o.pour || "?")} · ${f3(o.volume)} m³${tag ? ` <span class="sub">${tag}</span>` : ""}</label>`;
+        const kids = [...x.children.map((o, k) => row(o, k, true, x.exact ? "" : L2("(проверете)", "(check)"))),
+          ...x.partial.map((o, k) => row(o, x.children.length + k, false, L2("(частично извън)", "(partly outside)")))].join("<br>");
+        return `<tr><td><span class="name">${esc(x.record.pour || "?")}</span> <span class="sub">${x.present ? "" : L2("(вече го няма)", "(gone)")}</span>
+          <div class="sub">${esc(what)} · ${vol}</div><div style="margin:4px 0">${kids}</div>
+          <button class="small" data-act="splitApply" data-i="${i}">${L2("Прехвърли", "Pass on")}</button>
+          <button class="small secondary" data-act="splitShow" data-i="${i}">${L2("Покажи", "Show")}</button>
+          ${x.present ? `<button class="small secondary" data-act="splitSkip" data-i="${i}">${L2("Не", "No")}</button>` : ""}</td></tr>`;
+      }).join("");
+    }
     // orphans
     const present = new Set(state.objects.map((o) => o.guid));
-    const orph = S.orphans(state.records, present, state.objects.map((o) => ({ guid: o.guid, key: o.key, pour: o.group && (o.group.numbered ? o.group.key : o.group.label), obj: o })));
+    const splitFrom = new Set([...sp.filter((x) => !x.present).map((x) => x.guid), ...[...state.records.values()].map((r) => r.split_from).filter(Boolean)]);
+    const orph = S.orphans(new Map([...state.records].filter(([g]) => !splitFrom.has(g))), present, state.objects.map((o) => ({ guid: o.guid, key: o.key, pour: o.group && (o.group.numbered ? o.group.key : o.group.label), obj: o })));
     $("orphanBox").hidden = !orph.length;
     if (orph.length) {
       $("orphanText").textContent = lang === "bg"
@@ -439,6 +478,42 @@
         <td>${x.candidates.length ? `<button class="small" data-act="reattach" data-i="${i}" title="${esc(x.candidates.map((c) => c.guid).join(", "))}">${lang === "bg" ? "Прехвърли" : "Re-attach"} → ${x.candidates.length} ${x.exact ? "" : "?"}</button>` : `<span class="sub">${lang === "bg" ? "няма съвпадение" : "no match"}</span>`}</td></tr>`).join("");
       state.orphans = orph;
     }
+  }
+
+  // Pass formwork/rebar of a split pour on to its ticked new pieces; the parent's saved outline becomes the current one.
+  const splitPieces = (i) => {
+    const x = state.splits[i];
+    const all = [...x.children, ...x.partial];
+    return [...document.querySelectorAll(`input[data-split="${i}"]`)].filter((c) => c.checked).map((c) => all[+c.dataset.k]);
+  };
+  async function splitApply(i) {
+    const x = state.splits[i], pieces = splitPieces(i);
+    if (!pieces.length) return setStatus(L2("Не са избрани части.", "No pieces ticked."));
+    let done = 0;
+    await pool(pieces, 6, async (pc) => {
+      const props = S.inherit(x.record, x.guid, { by: state.user, pour: pc.pour, key: pc.key, snap: snapOf(pc.obj) });
+      await state.client.write(state.lib.id, state.defId, S.entityLink(pc.guid), props);
+      state.records.set(pc.guid, props); done++;
+    });
+    await splitClose(x, done);
+    setStatus(`${x.record.pour}: ${L2("статусът е прехвърлен на", "status passed on to")} ${done} ${L2("нови части", "new pieces")}`);
+    render();
+    if (state.coloured) await applyColours();
+  }
+  async function splitClose(x, pieces) {
+    const cur = state.objects.find((o) => o.guid === x.guid);
+    const next = S.splitDone(x.record, cur ? { by: state.user, snap: snapOf(cur), key: cur.key, pour: pourOf(cur), pieces } : { by: state.user, pieces });
+    await state.client.write(state.lib.id, state.defId, S.entityLink(x.guid), next);
+    state.records.set(x.guid, next);
+  }
+  async function splitSkip(i) {
+    await splitClose(state.splits[i], 0);
+    render();
+  }
+  async function splitShow(i) {
+    const x = state.splits[i];
+    const cur = state.objects.find((o) => o.guid === x.guid);
+    await selectObjects([...(cur ? [cur] : []), ...[...x.children, ...x.partial].map((o) => o.obj)]);
   }
 
   // Re-attach an orphaned status: copy it to the candidate object(s) (the old record stays, for history).
@@ -465,6 +540,9 @@
       if (act === "mark" || act === "undo" || act === "note" || act === "na") await applyStep(b.dataset.step, act);
       else if (act === "pickPour") await selectPour(state.pours[+b.dataset.i]);
       else if (act === "reattach") await reattach(state.orphans[+b.dataset.i]);
+      else if (act === "splitApply") await splitApply(+b.dataset.i);
+      else if (act === "splitSkip") await splitSkip(+b.dataset.i);
+      else if (act === "splitShow") await splitShow(+b.dataset.i);
     });
   });
   $("btnFromViewer").onclick = () => guarded(selectionFromViewer);
