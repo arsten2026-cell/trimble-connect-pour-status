@@ -169,7 +169,9 @@
     const objs = state.sel.slice();
     if (!objs.length) return;
     const has = (o) => (state.records.get(o.guid) || {})[stepId];
-    const targets = mode === "mark" ? objs : objs.filter(has);
+    // Partly done selection: "Готово" marks only the objects that do not have the step yet (the others keep theirs).
+    const partly = objs.some(has) && !objs.every(has);
+    const targets = mode === "mark" ? (partly ? objs.filter((o) => !has(o)) : objs) : objs.filter(has);
     if (!targets.length) return setStatus(lang === "bg" ? "Няма обекти с този етап." : "No objects with this step.");
     if (mode === "note" && keepNote) return setStatus(lang === "bg" ? "Напишете бележка." : "Type a note.");
     let done = 0, failed = 0, firstErr = "";
@@ -392,13 +394,16 @@
       const v = S.stepValues(state.records, guids, s.id);
       const label = !sel.length ? "" : st.state === "all" ? `✓ ${st.done}/${st.total}` : st.state === "mixed" ? `${st.done}/${st.total} ${t("done")}` : `0/${st.total}`;
       // Prefill with what is saved, so a correction or a note does not reset the date. Different values: empty = keep each one's.
-      const dateVal = v.mixedDate ? "" : v.date || S.today();
-      const notePh = v.mixedNote ? L2("различни бележки – празно = без промяна", "different notes – empty = keep") : t("note");
+      // Partly done: the boxes are for the objects not done yet (today, empty note); select the done ones to correct them.
+      const partly = st.state === "mixed";
+      const dateVal = partly ? S.today() : v.mixedDate ? "" : v.date || S.today();
+      if (partly) { v.mixedNote = false; v.note = ""; }
+      const notePh = v.mixedNote ?L2("различни бележки – празно = без промяна", "different notes – empty = keep") : t("note");
       return `<div class="step" style="--c:${s.colour}">
         <div class="hd"><span class="nm">${i + 1}. ${esc(stepName(s))}</span><span class="st ${st.state}">${label}</span></div>
         ${st.dates.length ? `<div class="dates">${esc(st.dates.join(", "))}</div>` : ""}
         <div class="row"><input type="date" id="date_${s.id}" value="${esc(dateVal)}" title="${v.mixedDate ? esc(L2("различни дати – празно = без промяна", "different dates – empty = keep")) : ""}"><input type="text" id="note_${s.id}" data-mixed="${v.mixedNote ? 1 : 0}" value="${esc(v.note || "")}" placeholder="${esc(notePh)}"></div>
-        <div class="row"><button class="small" data-act="mark" data-step="${s.id}" ${sel.length ? "" : "disabled"}>${esc(st.done ? t("save") : t("markDone"))}</button><button
+        <div class="row"><button class="small" data-act="mark" data-step="${s.id}" ${sel.length ? "" : "disabled"}>${esc(partly ? `${t("markDone")} (${st.total - st.done})` : st.done ? t("save") : t("markDone"))}</button><button
           class="small secondary" data-act="note" data-step="${s.id}" ${st.done ? "" : "disabled"} title="${esc(t("noteOnlyTip"))}">${esc(t("noteOnly"))}</button><button
           class="small secondary" data-act="undo" data-step="${s.id}" ${st.done ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
     }).join("");
