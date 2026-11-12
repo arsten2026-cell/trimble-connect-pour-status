@@ -36,7 +36,7 @@
     "VIEWERS": "viewer",
   };
   /** Which roles may use which kind of extension. Roles not listed anywhere have no access. */
-  const APPS = { execution: ["admin", "gc"], admin: ["admin"], projectStatus: ["admin", "client"] };
+  const APPS = { execution: ["admin", "gc"], admin: ["admin"], projectStatus: ["admin", "client", "gc"] };   // projectStatus: GC too (user, 12.11)
   /** When someone is in several groups, the first role in this order wins. */
   const ROLE_ORDER = ["admin", "gc", "client", "subcontractor", "designer", "viewer"];
   const DEFAULTS = { groupRoles: GROUP_ROLES, apps: APPS, cacheMinutes: 10 };
@@ -134,10 +134,12 @@
   // ---------- network ----------
   async function coreGet(base, path, getToken, fetchImpl) {
     const f = fetchImpl || fetch;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // 401: refresh the token and retry. Right after an extension is installed/allowed the first token can be refused
+    // for a moment, so the last tries wait a little (seen live 12.11.2026).
+    for (let attempt = 0; attempt < 4; attempt++) {
       const token = await getToken(attempt > 0);
       const res = await f(base + path, { headers: { Authorization: "Bearer " + token, Range: "items=0-999" } });
-      if (res.status === 401 && attempt === 0) continue;
+      if (res.status === 401 && attempt < 3) { if (attempt > 0 && !fetchImpl) await new Promise((r) => setTimeout(r, 1500 * attempt)); continue; }
       if (!res.ok) throw new Error(`Core API ${path.split("?")[0]}: ${res.status}`);
       return res.json();
     }
