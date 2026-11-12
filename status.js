@@ -11,8 +11,8 @@
   const STEPS = [
     { id: "formwork", en: "Formwork done", bg: "Кофраж готов", colour: "#F2B705", na: true },
     { id: "rebar", en: "Rebar done", bg: "Армировка готова", colour: "#E37424", na: true },
-    { id: "poured", en: "Poured", bg: "Излят", colour: "#2E7D32" },
-    { id: "stripped", en: "Formwork removed", bg: "Декофриран", colour: "#1F4FD1", na: true },
+    { id: "poured", en: "Poured", bg: "Излят", colour: "#1F4FD1" },
+    { id: "stripped", en: "Formwork removed", bg: "Декофриран", colour: "#2E7D32", na: true }   // green = finished,
   ];
   const NOT_STARTED = { id: "none", en: "Not started", bg: "Не е започнат", colour: "#9E9E9E" };
   // Rebar done before formwork (e.g. columns): not ready to pour yet, so not the same colour as "rebar done".
