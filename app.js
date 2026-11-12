@@ -12,7 +12,7 @@
     title: ["Pour status · Статус тактове", "Pour status · Статус тактове"],
     selection: ["Избрано", "Selection"], steps: ["Етапи", "Steps"], view: ["Изглед", "View"], pours: ["Тактове", "Pours"],
     fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], csv: ["Експорт Excel", "Export Excel"], clear: ["Изчисти", "Clear"],
-    colour: ["Оцвети по статус", "Colour by status"], seeThrough: ["Незапочнатите прозрачни", "Not started see-through"], orphans: ["Статус без обект", "Status without object"],
+    colour: ["Оцвети по статус", "Colour by status"], seeThrough: ["Незапочнатите прозрачни", "Not started see-through"], hideRebar: ["Скрий армировката", "Hide rebar"], orphans: ["Статус без обект", "Status without object"],
     nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
       "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
     markDone: ["Готово", "Mark done"], undo: ["Отмени", "Undo"], note: ["Бележка (по избор)", "Note (optional)"],
@@ -229,6 +229,22 @@
     if (state.coloured) await applyColours();
   }
 
+  // ---------- rebar visibility ----------
+  // Rebar as Tekla exports it to IFC. Hidden/shown with the viewer's own visibility ("Reset model" shows it again).
+  const REBAR_CLASSES = ["IfcReinforcingBar", "IfcReinforcingMesh", "IfcTendon"];
+  async function setRebarVisible(visible) {
+    let n = 0;
+    for (const cls of REBAR_CLASSES) {
+      let found;
+      try { found = await state.api.viewer.getObjects({ parameter: { class: cls } }); } catch { continue; }
+      const ids = (found || []).filter((m) => (m.objects || []).length).map((m) => ({ modelId: m.modelId, objectRuntimeIds: m.objects.map((o) => o.id) }));
+      if (!ids.length) continue;
+      n += ids.reduce((t, m) => t + m.objectRuntimeIds.length, 0);
+      await state.api.viewer.setObjectState({ modelObjectIds: ids }, { visible });
+    }
+    return n;
+  }
+
   // ---------- colours ----------
   const STAGES = S.STAGES;   // not started, formwork, rebar first (formwork pending), rebar, poured, stripped
   const NOT_STARTED_OPACITY = 0.15;
@@ -409,6 +425,7 @@
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
     $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
     $("lblColour").textContent = t("colour");
+    $("lblHideRebar").textContent = t("hideRebar"); $("chkHideRebar").checked = !!state.rebarHidden;
     $("lblSeeThrough").textContent = t("seeThrough"); $("chkSeeThrough").checked = state.seeThrough;
     if (!state.ready) return;
     // selection
@@ -617,6 +634,12 @@
     try { localStorage.setItem("arsten.pourStatus.seeThrough", state.seeThrough ? "1" : "0"); } catch {}
     render();
     if (state.coloured) await applyColours();
+  });
+  $("chkHideRebar").onchange = (e) => guarded(async () => {
+    state.rebarHidden = e.target.checked;
+    const n = await setRebarVisible(!state.rebarHidden);
+    setStatus(n ? `${state.rebarHidden ? L2("Скрита армировка", "Rebar hidden") : L2("Показана армировка", "Rebar shown")}: ${n}`
+      : L2("Няма армировка в заредените модели.", "No rebar in the loaded models."));
   });
   $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; await applyColours(); });
   $("selLang").value = lang;
