@@ -106,6 +106,30 @@
       return out;
     }
 
+    /**
+     * Every pset of a definition (also of objects no longer in the model), as the official JS SDK's
+     * listPSetsByDefinition: GET libs/{lib}/defs/{def}/psets?top=&skiptoken=&link=, paged by `next`.
+     * Returns Map link -> props (deleted psets skipped).
+     */
+    async listAll(libId, defId, linkPrefix) {
+      const out = new Map();
+      const q = (tok) => ["top=500", linkPrefix ? "link=" + encodeURIComponent(linkPrefix) : "", tok ? "skiptoken=" + encodeURIComponent(tok) : ""].filter(Boolean).join("&");
+      let path = `libs/${encodeURIComponent(libId)}/defs/${encodeURIComponent(defId)}/psets?${q()}`;
+      for (let page = 0; path && page < 200; page++) {
+        const res = await this.request("pset", path);
+        for (const p of (res && res.items) || []) if (p && p.link && !p.deleted) out.set(p.link, p.props || {});
+        const next = res && res.next;
+        if (!next) break;
+        if (/^https?:/.test(next)) {   // absolute link: keep only the part after the service root
+          const m = /\/v1\/(.+)$/.exec(next);
+          path = m ? m[1] : null;
+        } else if (/^[?&]?skiptoken=/i.test(next) || !/[/?]/.test(next)) {
+          path = `libs/${encodeURIComponent(libId)}/defs/${encodeURIComponent(defId)}/psets?${q(next.replace(/^[?&]?skiptoken=/i, ""))}`;
+        } else path = next.replace(/^\//, "").replace(/^v1\//, "");
+      }
+      return out;
+    }
+
     /** Write (create or update) the status of one object. PATCH merges: fields left out keep their value. */
     write(libId, defId, link, props) {
       return this.request("pset", psetPath(link, libId, defId), "PATCH", { props: clean(props) });

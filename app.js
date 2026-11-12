@@ -129,8 +129,20 @@
     const b = $("btnRecheck"); if (b) b.onclick = () => guarded(start2);
   }
   async function loadRecords() {
+    // All records of the definition, including objects no longer in the model (needed for merges, splits where the
+    // original is gone, and "Статус без обект"). Fallback: only the objects in the model.
     const links = state.objects.map((o) => S.entityLink(o.guid));
+    // Always also read the objects in the model directly, so a list call that fails or returns less loses nothing.
     const got = await state.client.readMany(state.lib.id, state.defId, links);
+    try {
+      const all = await state.client.listAll(state.lib.id, state.defId, "frn:entity:");
+      for (const [link, props] of all) if (!got.has(link)) got.set(link, props);
+      state.listMode = "all";
+      state.listCount = all.size;
+    } catch (e) {
+      console.warn("Listing all statuses failed, reading only objects in the model:", e);
+      state.listMode = "model";
+    }
     state.records = new Map();
     for (const [link, props] of got) state.records.set(link.replace(/^frn:entity:/, ""), props);
   }
@@ -617,7 +629,8 @@
     await loadRecords();
     state.ready = true;
     $("mainBox").hidden = false;
-    setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${state.records.size} ${lang === "bg" ? "със статус" : "with status"}`);
+    const inModel = state.objects.filter((o) => state.records.has(o.guid)).length, outside = state.records.size - inModel;
+    setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}${outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : ""}`);
     render();
   }
   async function start(api, client) {
