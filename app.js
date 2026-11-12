@@ -12,7 +12,7 @@
     title: ["Pour status · Статус тактове", "Pour status · Статус тактове"],
     selection: ["Избрано", "Selection"], steps: ["Етапи", "Steps"], view: ["Изглед", "View"], pours: ["Тактове", "Pours"],
     fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], csv: ["Експорт Excel", "Export Excel"], clear: ["Изчисти", "Clear"],
-    colour: ["Оцвети по статус", "Colour by status"], orphans: ["Статус без обект", "Status without object"],
+    colour: ["Оцвети по статус", "Colour by status"], seeThrough: ["Незапочнатите прозрачни", "Not started see-through"], orphans: ["Статус без обект", "Status without object"],
     nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
       "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
     markDone: ["Готово", "Mark done"], undo: ["Отмени", "Undo"], note: ["Бележка (по избор)", "Note (optional)"],
@@ -34,6 +34,7 @@
     records: new Map(),                      // guid -> status props
     sel: [],                                 // selected pour objects
     coloured: false,
+    seeThrough: (() => { try { return localStorage.getItem("arsten.pourStatus.seeThrough") !== "0"; } catch { return true; } })(),   // not started = see-through (default on)
   };
   const objKey = (o) => o.modelId + ":" + o.id;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -221,7 +222,7 @@
     // Not started: see-through grey, so what is underneath stays visible. Started: solid stage colour.
     // Opacity is 0..1 in Connect (verified in Pour tags).
     for (let k = 0; k < STAGES.length; k++) {
-      if (buckets[k].length) await api.viewer.setObjectState(sel(buckets[k]), { color: STAGES[k].colour, opacity: k === 0 ? NOT_STARTED_OPACITY : 1 });
+      if (buckets[k].length) await api.viewer.setObjectState(sel(buckets[k]), { color: STAGES[k].colour, opacity: k === 0 && state.seeThrough ? NOT_STARTED_OPACITY : 1 });
     }
   }
 
@@ -377,6 +378,7 @@
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
     $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
     $("lblColour").textContent = t("colour");
+    $("lblSeeThrough").textContent = t("seeThrough"); $("chkSeeThrough").checked = state.seeThrough;
     if (!state.ready) return;
     // selection
     const sel = state.sel;
@@ -408,7 +410,7 @@
           class="small secondary" data-act="undo" data-step="${s.id}" ${st.done ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
     }).join("");
     // legend
-    $("legend").innerHTML = STAGES.map((s, k) => `<span><span class="sw" style="background:${s.colour}${k === 0 ? `;opacity:${NOT_STARTED_OPACITY + 0.25}` : ""}"></span>${esc(stepName(s))}${k === 0 ? ` <span class="sub">(${lang === "bg" ? "прозрачно" : "see-through"})</span>` : ""}</span>`).join("");
+    $("legend").innerHTML = STAGES.map((s, k) => `<span><span class="sw" style="background:${s.colour}${k === 0 && state.seeThrough ? `;opacity:${NOT_STARTED_OPACITY + 0.25}` : ""}"></span>${esc(stepName(s))}${k === 0 && state.seeThrough ? ` <span class="sub">(${lang === "bg" ? "прозрачно" : "see-through"})</span>` : ""}</span>`).join("");
     // summary
     const short = lang === "bg" ? ["Кофр.", "Арм.", "Излят", "Декофр."] : ["Form.", "Rebar", "Poured", "Stripped"];
     $("sumHead").innerHTML = `<tr><th>${esc(t("pour"))}</th>${short.map((h) => `<th class="n">${h}</th>`).join("")}<th></th></tr>`;
@@ -476,6 +478,12 @@
     followTimer = setTimeout(() => guarded(() => selectionFromViewer(true)), 200);
   }
   $("btnSelClear").onclick = () => { state.sel = []; render(); };
+  $("chkSeeThrough").onchange = (e) => guarded(async () => {
+    state.seeThrough = e.target.checked;
+    try { localStorage.setItem("arsten.pourStatus.seeThrough", state.seeThrough ? "1" : "0"); } catch {}
+    render();
+    if (state.coloured) await applyColours();
+  });
   $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; await applyColours(); });
   $("selLang").value = lang;
   $("selLang").onchange = (e) => { lang = e.target.value; try { localStorage.setItem("arsten.pourStatus.lang", lang); } catch {} render(); if (!state.ready && state.client) guarded(start2); };

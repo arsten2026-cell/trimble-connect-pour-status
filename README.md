@@ -17,6 +17,8 @@ Static files only; the panel talks to Trimble Connect directly with the signed-i
 - With objects selected that already have a step, its date and note boxes show the saved values; the button reads
   "Запиши" and overwrites (history: "corrected"). Different values across the selection: the box is empty and
   empty means keep each object's own value.
+- "Незапочнатите прозрачни" (under "Оцвети по статус", remembered per browser): not-started objects see-through
+  grey (on) or solid grey (off).
 - Partly done selection: "Готово (n)" marks only the n objects without the step (today by default); the
   others are untouched. Select the done ones to correct them.
 - "Само бележка" changes only the note (date and who stay; history: "note: …"). Empty clears the note.
