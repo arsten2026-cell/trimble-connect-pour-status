@@ -40,6 +40,10 @@ every other piece a new GUID (no status). No parent link is exported, so the pan
   pieces must rebuild the centre saved in `key` at marking (others are offered unticked as probable neighbours).
 - Panel section "Разделени тактове": ticked pieces, volume check, Прехвърли (pieces get formwork/rebar with the
   parent's date/who, `split_from`, quantity 0 when the parent's quantity is frozen), Покажи, Не (keep as is).
+- Pour break removed again ("Обединени отново"): a gone record linked by `split_from` (parent, piece or sibling) whose
+  saved outline is now covered by a present linked object. "Потвърди" sums the frozen quantities into the merged
+  object (original's quantity back if Tekla kept a piece's GUID, not doubled if it kept the original's), updates its
+  outline, and sets `merged_into` on the gone records, which takes them out of "Статус без обект".
 - Excel uses the frozen quantity of each step; Детайли has "Записано ≠ модел" where it differs from the model now.
 
 ## Excel export (for invoicing)

@@ -43,6 +43,7 @@
     add("snap_bbox", { type: "string" }, "Outline at marking / Габарит при отбелязване");
     add("snap_volume", { type: "string" }, "Volume at marking / Обем при отбелязване");
     add("split_from", { type: "string" }, "Split from / Разделен от");
+    add("merged_into", { type: "string" }, "Merged into / Обединен в");
     add("pour", { type: "string" }, "Pour / Такт");
     add("key", { type: "string" }, "Match key / Ключ");
     add("log", { type: "string" }, "History / История");   // "long-text" format is rejected by pset-api (422, 2026-11); length capped by LOG_MAX in code
@@ -254,7 +255,7 @@
   function orphans(records, present, objects) {
     const out = [];
     for (const [guid, r] of records) {
-      if (present.has(guid) || !stageIndex(r)) continue;
+      if (present.has(guid) || !stageIndex(r) || r.merged_into) continue;
       const exact = objects.filter((o) => r.key && o.key === r.key);
       const samePour = exact.length ? [] : objects.filter((o) => r.pour && o.pour === r.pour);
       out.push({ guid, record: r, candidates: exact.length ? exact : samePour, exact: exact.length > 0 });
@@ -454,6 +455,55 @@
     return r;
   }
 
+  // ---------- pour break removed again (pieces merged back) ----------
+  /**
+   * Records of pieces that disappeared because Tekla merged them back into one object. A gone record is merged into a
+   * present object when they are linked by a split (parent/piece/sibling via split_from) and the present object now
+   * covers the gone one's saved outline. Works whichever GUID Tekla keeps.
+   * @returns [{into, gone: [{guid, record}]}]
+   */
+  function merges(records, objects) {
+    const byGuid = new Map(objects.map((o) => [o.guid, o]));
+    const out = new Map();
+    for (const [g, r] of records) {
+      if (byGuid.has(g) || r.merged_into || !hasSteps(r)) continue;
+      const snap = bboxOf(r.snap_bbox);
+      if (!snap) continue;
+      const linked = (mg, mr) => mg === r.split_from || (mr && mr.split_from && (mr.split_from === g || mr.split_from === r.split_from));
+      const into = objects.find((o) => o.bbox && o.guid !== g && linked(o.guid, records.get(o.guid)) && inside(snap, o.bbox));
+      if (!into) continue;
+      if (!out.has(into.guid)) out.set(into.guid, { into: into.guid, gone: [] });
+      out.get(into.guid).gone.push({ guid: g, record: r });
+    }
+    return [...out.values()];
+  }
+
+  /**
+   * The merged object's record: its frozen quantities become the sum over the merged records (so the original's
+   * quantity comes back when Tekla kept a piece's GUID, and is not doubled when it kept the original's), outline updated.
+   */
+  function mergeBack(rec, gone, info) {
+    const r = Object.assign({}, rec || {});
+    for (const st of STEPS) {
+      const all = [r, ...gone.map((x) => x.record)].filter((x) => x[st.id] && x[`${st.id}_qty`] != null);
+      if (!r[st.id] || !all.length) continue;
+      r[`${st.id}_qty`] = numText(all.reduce((t, x) => t + (parseFloat(x[`${st.id}_qty`]) || 0), 0));
+    }
+    if (info.snap && info.snap.bbox) r.snap_bbox = bboxText(info.snap.bbox);
+    if (info.snap && info.snap.volume != null && isFinite(info.snap.volume)) r.snap_volume = numText(info.snap.volume);
+    if (info.key != null) r.key = info.key;
+    if (info.pour != null) r.pour = info.pour;
+    r.log = appendLog(r.log, logLine(`merged back: pour break removed, ${gone.length} piece(s) (${gone.map((x) => x.guid).join(", ")}), by ${info.by || "?"}`, info.now));
+    r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`;
+    return r;
+  }
+  /** A gone piece's record after the merge: points to the object it is now part of. */
+  function mergedInto(rec, intoGuid, info) {
+    const r = Object.assign({}, rec, { merged_into: intoGuid });
+    r.log = appendLog(r.log, logLine(`merged into ${intoGuid} (pour break removed), by ${info.by || "?"}`, info.now));
+    return r;
+  }
+
   return { STEPS, NOT_STARTED, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
-    markNa, isNa, setNote, splits, inherit, splitDone, bboxText, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
+    markNa, isNa, setNote, splits, inherit, splitDone, merges, mergeBack, mergedInto, bboxText, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
 });

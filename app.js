@@ -393,7 +393,7 @@
     $("title").textContent = t("title");
     $("hSel").textContent = t("selection"); $("hSteps").textContent = t("steps"); $("hView").textContent = t("view");
     $("btnCsv").textContent = t("csv");
-    $("hSummary").textContent = t("pours"); $("hOrphans").textContent = t("orphans"); $("hSplits").textContent = L2("Разделени тактове", "Split pours");
+    $("hSummary").textContent = t("pours"); $("hOrphans").textContent = t("orphans"); $("hSplits").textContent = L2("Разделени тактове", "Split pours"); $("hMerges").textContent = L2("Обединени отново", "Merged back");
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
     $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
     $("lblColour").textContent = t("colour");
@@ -464,9 +464,24 @@
           ${x.present ? `<button class="small secondary" data-act="splitSkip" data-i="${i}">${L2("Не", "No")}</button>` : ""}</td></tr>`;
       }).join("");
     }
+    // pour break removed again: pieces merged back into one object
+    const mg = S.merges(state.records, splitObjs);
+    state.merges = mg;
+    $("mergeBox").hidden = !mg.length;
+    if (mg.length) {
+      $("mergeRows").innerHTML = mg.map((x, i) => {
+        const o = state.objects.find((v) => v.guid === x.into);
+        return `<tr><td><span class="name">${esc(o ? pourOf(o) : "?")}</span>
+          <div class="sub">${L2(`Разделянето е премахнато: ${x.gone.length + 1} части отново са един обект. Статусът остава; количествата се обединяват.`,
+            `The pour break was removed: ${x.gone.length + 1} pieces are one object again. The status stays; quantities are combined.`)}</div>
+          <button class="small" data-act="mergeApply" data-i="${i}">${L2("Потвърди", "Confirm")}</button>
+          <button class="small secondary" data-act="mergeShow" data-i="${i}">${L2("Покажи", "Show")}</button></td></tr>`;
+      }).join("");
+    }
     // orphans
     const present = new Set(state.objects.map((o) => o.guid));
-    const splitFrom = new Set([...sp.filter((x) => !x.present).map((x) => x.guid), ...[...state.records.values()].map((r) => r.split_from).filter(Boolean)]);
+    const mergedGone = new Set(mg.flatMap((x) => x.gone.map((g) => g.guid)));
+    const splitFrom = new Set([...mergedGone, ...sp.filter((x) => !x.present).map((x) => x.guid), ...[...state.records.values()].map((r) => r.split_from).filter(Boolean)]);
     const orph = S.orphans(new Map([...state.records].filter(([g]) => !splitFrom.has(g))), present, state.objects.map((o) => ({ guid: o.guid, key: o.key, pour: o.group && (o.group.numbered ? o.group.key : o.group.label), obj: o })));
     $("orphanBox").hidden = !orph.length;
     if (orph.length) {
@@ -516,6 +531,27 @@
     await selectObjects([...(cur ? [cur] : []), ...[...x.children, ...x.partial].map((o) => o.obj)]);
   }
 
+  // Pour break removed: write the merged object's record (combined frozen quantities, current outline) and mark the
+  // gone pieces' records as merged into it (they leave "Статус без обект").
+  async function mergeApply(i) {
+    const x = state.merges[i];
+    const o = state.objects.find((v) => v.guid === x.into);
+    const next = S.mergeBack(state.records.get(x.into), x.gone, { by: state.user, snap: o ? snapOf(o) : null, key: o && o.key, pour: o ? pourOf(o) : null });
+    await state.client.write(state.lib.id, state.defId, S.entityLink(x.into), next);
+    state.records.set(x.into, next);
+    for (const g of x.gone) {
+      const r = S.mergedInto(g.record, x.into, { by: state.user });
+      await state.client.write(state.lib.id, state.defId, S.entityLink(g.guid), r);
+      state.records.set(g.guid, r);
+    }
+    setStatus(`${o ? pourOf(o) : ""}: ${L2("обединяването е записано", "merge saved")}`);
+    render();
+  }
+  async function mergeShow(i) {
+    const o = state.objects.find((v) => v.guid === state.merges[i].into);
+    if (o) await selectObjects([o]);
+  }
+
   // Re-attach an orphaned status: copy it to the candidate object(s) (the old record stays, for history).
   async function reattach(x) {
     const ok = window.confirm(lang === "bg"
@@ -543,6 +579,8 @@
       else if (act === "splitApply") await splitApply(+b.dataset.i);
       else if (act === "splitSkip") await splitSkip(+b.dataset.i);
       else if (act === "splitShow") await splitShow(+b.dataset.i);
+      else if (act === "mergeApply") await mergeApply(+b.dataset.i);
+      else if (act === "mergeShow") await mergeShow(+b.dataset.i);
     });
   });
   $("btnFromViewer").onclick = () => guarded(selectionFromViewer);
