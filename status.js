@@ -63,11 +63,16 @@
     return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
   }
 
-  /** Index of the furthest step actually done (0 = not started, 1..4); "without" steps do not count. */
+  /** Index of the furthest step done (0 = not started, 1..4). */
   function stageIndex(rec) {
     if (!rec) return 0;
     let k = 0;
-    STEPS.forEach((s, i) => { if (rec[s.id] && !rec[`${s.id}_na`]) k = i + 1; });   // "without" steps are not progress
+    // A "without" step counts as progress once the step before it is covered (so formwork "without" = ready for rebar,
+    // but the automatic stripped "without" only counts after the pour).
+    STEPS.forEach((s, i) => {
+      if (!rec[s.id]) return;
+      if (!rec[`${s.id}_na`] || i === 0 || rec[STEPS[i - 1].id]) k = i + 1;
+    });
     return k;
   }
   const stageOf = (rec) => (stageIndex(rec) ? STEPS[stageIndex(rec) - 1] : NOT_STARTED);
@@ -120,8 +125,8 @@
   }
 
   /**
-   * Mark a step as "without" (does not apply: no formwork, no rebar). It counts as covered for progress but earns no
-   * quantity. Without formwork also means nothing to strip, so stripped is set to "without" too unless already done.
+   * Mark a step as "without" (does not apply: no formwork, no rebar). It counts as done for progress (the next step can go
+   * ahead) but earns no quantity. Without formwork also means nothing to strip, so stripped is set to "without" too unless already done.
    */
   function markNa(rec, stepId, info) {
     const step = STEPS.find((s) => s.id === stepId);
