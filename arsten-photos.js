@@ -129,6 +129,26 @@
     return { blob, taken, w, h, originalSize: file.size, size: blob.size, name: file.name };
   }
 
+
+  /** Lightbox zoom: click the photo for full size (scrolls, centred on the click), click again to fit. */
+  function wireZoom(view) {
+    if (!view) return;
+    view.onclick = (e) => {
+      const img = view.querySelector("img");
+      if (!img || !img.naturalWidth) return;
+      if (view.classList.contains("zoom")) { view.classList.remove("zoom"); return; }
+      const r = img.getBoundingClientRect();
+      // where in the fitted picture was clicked (object-fit: contain leaves bars around it)
+      const k = Math.min(r.width / img.naturalWidth, r.height / img.naturalHeight);
+      const w = img.naturalWidth * k, h = img.naturalHeight * k;
+      const fx = Math.min(1, Math.max(0, (e.clientX - r.left - (r.width - w) / 2) / w));
+      const fy = Math.min(1, Math.max(0, (e.clientY - r.top - (r.height - h) / 2) / h));
+      view.classList.add("zoom");
+      view.scrollLeft = fx * img.naturalWidth - view.clientWidth / 2;
+      view.scrollTop = fy * img.naturalHeight - view.clientHeight / 2;
+    };
+  }
+
   // ---------- UI ----------
   const CSS = `
   .ph-drop{border:1px dashed var(--line,#d9d5cc);padding:8px;text-align:center;font-size:12px;color:var(--muted,#6b6b6b);background:var(--panel,#fff)}
@@ -140,7 +160,12 @@
   .ph-th span{position:absolute;left:0;right:0;bottom:0;background:rgba(0,0,0,.55);color:#fff;font-size:9.5px;padding:1px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .ph-q{font-size:11px;margin-top:4px}
   .ph-box{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:50;display:flex;flex-direction:column;padding:8px;color:#fff}
-  .ph-box img{flex:1;min-height:0;object-fit:contain;width:100%}
+
+  .ph-box .ph-view{flex:1;min-height:0;overflow:hidden;display:flex;cursor:zoom-in}
+  .ph-box .ph-view img{flex:1;min-height:0;min-width:0;object-fit:contain;width:100%}
+  .ph-box .ph-view.zoom{display:block;overflow:auto;cursor:zoom-out}
+  .ph-box .ph-view.zoom img{width:auto;height:auto;max-width:none;flex:none}
+  .ph-box a.ph-open{font-size:12px;padding:2px 8px;background:#fff;color:#1f1f1f;border:1px solid #fff;text-decoration:none}
   .ph-box .ph-meta{font-size:12px;padding:6px 0}
   .ph-box .ph-acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:space-between;align-items:center}
   .ph-box .ph-acts .ph-r{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
@@ -152,12 +177,12 @@
       needSel: "Изберете обект(и) в модела, за да добавите снимки към тях.", to: "Към", sel: "За избраното", all: "Всички по дни", filter: "Филтър (такт / марка)",
       none: "Няма снимки.", noneSel: "Няма снимки за избраното.", up: "Качване", done: "качена", fail: "грешка", show: "Покажи в модела", del: "Изтрий",
       delAsk: "Да се изтрие ли снимката? Това не може да се отмени.", yes: "Да, изтрий", no: "Не", close: "Затвори", orig: "оригинал",
-      native: "Връзка в Connect", noNative: "без връзка в Connect (само в нашия списък)", loading: "Зареждане…" },
+      native: "Връзка в Connect", openNew: "Отвори в нов прозорец", zoom: "Щракнете за увеличение", noNative: "без връзка в Connect (само в нашия списък)", loading: "Зареждане…" },
     en: { title: "Photos", add: "Add photos", camera: "Camera", drop: "Drop photos here or choose files", caption: "Caption (optional)",
       needSel: "Select object(s) in the model to add photos to them.", to: "To", sel: "For the selection", all: "All by day", filter: "Filter (pour / mark)",
       none: "No photos.", noneSel: "No photos for the selection.", up: "Uploading", done: "uploaded", fail: "failed", show: "Show in model", del: "Delete",
       delAsk: "Delete this photo? This cannot be undone.", yes: "Yes, delete", no: "No", close: "Close", orig: "original",
-      native: "Linked in Connect", noNative: "not linked in Connect (our list only)", loading: "Loading…" },
+      native: "Linked in Connect", openNew: "Open in new window", zoom: "Click to zoom", noNative: "not linked in Connect (our list only)", loading: "Loading…" },
   };
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -333,14 +358,15 @@
         <div class="ph-list">${body}</div>
         ${st.open ? box(st.open) : ""}`;
       wire();
-      opts.el.querySelectorAll("img[data-src]").forEach((img) => { const r = st.records.find((x) => x.file_id === img.dataset.src); if (r) urlOf(r).then((u) => { if (u) img.src = u; }).catch(() => {}); });
+      opts.el.querySelectorAll("img[data-src]").forEach((img) => { const r = st.records.find((x) => x.file_id === img.dataset.src); if (r) urlOf(r).then((u) => { if (!u) return; img.src = u; const a = img.closest(".ph-box") && opts.el.querySelector(".ph-open"); if (a) a.href = u; }).catch(() => {}); });
+      wireZoom(opts.el.querySelector(".ph-view"));
     }
     function box(r) {
       const l = L();
-      return `<div class="ph-box"><img alt="" data-src="${esc(r.file_id)}">
+      return `<div class="ph-box"><div class="ph-view" title="${esc(L().zoom)}"><img alt="" data-src="${esc(r.file_id)}"></div>
         <div class="ph-meta"><b>${esc(r.labels)}</b>${r.purpose ? ` · ${esc(((opts.purposes || []).find((p) => p.id === r.purpose) || {})[opts.lang === "en" ? "en" : "bg"] || r.purpose)}` : ""}${r.caption ? " – " + esc(r.caption) : ""}<br>${esc(r.taken.replace("T", " ").slice(0, 16))} · ${esc(r.by)} · ${esc(r.size)} · ${r.links ? l.native : l.noNative}</div>
         <div class="ph-acts">${st.confirm ? `<span>${l.delAsk}</span><button class="small ph-bad" data-pha="yes">${l.yes}</button><button class="small" data-pha="no">${l.no}</button>`
-          : `${canDelete(r) ? `<button class="small ph-bad" data-pha="del">${l.del}</button>` : ""}<span class="ph-r"><button class="small" data-pha="show">${l.show}</button><button class="small" data-pha="close">${l.close}</button></span>`}</div></div>`;
+          : `${canDelete(r) ? `<button class="small ph-bad" data-pha="del">${l.del}</button>` : ""}<span class="ph-r"><a class="ph-open" target="_blank" rel="noopener" href="#">${l.openNew}</a><button class="small" data-pha="show">${l.show}</button><button class="small" data-pha="close">${l.close}</button></span>`}</div></div>`;
     }
     function wire() {
       const el = opts.el, g = (fn) => () => Promise.resolve().then(fn).catch((e) => say(e.message, true));
@@ -375,5 +401,5 @@
     return { render, reload: load, state: st };
   }
 
-  return { DEF_ID, definition, photoPrefix, photoLink, fileName, exifDate, groupByDay, forObjects, parseObjects, fmtSize, coreClient, prepareImage, mount };
+  return { DEF_ID, wireZoom, definition, photoPrefix, photoLink, fileName, exifDate, groupByDay, forObjects, parseObjects, fmtSize, coreClient, prepareImage, mount };
 });

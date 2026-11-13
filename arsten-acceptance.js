@@ -124,10 +124,29 @@
   function latestCovering(records, pour, step) {
     return records.filter((r) => valid(r) && r.pour === pour && (r.step === step || r.step === "both")).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0] || null;
   }
+  /**
+   * Colour state of each pour for the model view: for every step shown, the latest request covering it; the pour takes
+   * the "worst" of them (rejected > open > remarks > approved). step: "all" | "formwork" | "rebar".
+   * @returns [{pour, status, objects: [{modelId, guid}]}]
+   */
+  function pourStates(records, step) {
+    const RANK = { rejected: 4, open: 3, remarks: 2, approved: 1 };
+    const rs = records.filter(valid), pours = [...new Set(rs.map((r) => r.pour))], out = [];
+    for (const pour of pours) {
+      const steps = step === "formwork" || step === "rebar" ? [step] : ["formwork", "rebar"];
+      const latestOf = steps.map((s) => latestCovering(rs, pour, s)).filter(Boolean);
+      if (!latestOf.length) continue;
+      const worst = latestOf.reduce((a, b) => ((RANK[b.status] || 0) > (RANK[a.status] || 0) ? b : a));
+      const objs = new Map();
+      for (const r of rs.filter((x) => x.pour === pour)) for (const o of parseObjects(r.objects)) objs.set(o.modelId + ":" + o.guid, { modelId: o.modelId, guid: o.guid });
+      out.push({ pour, status: worst.status, objects: [...objs.values()] });
+    }
+    return out;
+  }
   /** Pours (labels) whose rebar is not approved (no request, open or rejected) – for the warning on "Излят". */
   function rebarNotApproved(records, pours) {
     return [...new Set(pours)].filter((p) => { const r = latestCovering(records, p, "rebar"); return !r || !(r.status === "approved" || r.status === "remarks"); });
   }
 
-  return { DEF_ID, STEPS, STATUS, APPROVER_GROUP, full, valid, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, latestCovering, rebarNotApproved, parseObjects, ids };
+  return { DEF_ID, STEPS, STATUS, APPROVER_GROUP, full, valid, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, latestCovering, pourStates, rebarNotApproved, parseObjects, ids };
 });
