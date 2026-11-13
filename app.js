@@ -229,6 +229,22 @@
     if (state.coloured) await applyColours();
   }
 
+  // ---------- site photos (shared/arsten-photos.js) ----------
+  // Same library as the statuses (definition "photo"). This panel is for admins and the general contractor only,
+  // so everyone here may add photos; admins may delete anyone's, the others their own.
+  function mountPhotos() {
+    if (state.photos || !window.ArstenPhotos || !state.lib) return;
+    const opts = {
+      el: $("photosBox"), api: state.api, getToken, project: state.project, user: state.user, client: state.client, libId: state.lib.id,
+      coreBase: ArstenAccess.coreBase(state.project.location), core: window.ARSTEN_PHOTOS_CORE || undefined,
+      canAdd: true, canDeleteAny: !!(state.access && state.access.role === "admin"), lang,
+      targets: () => state.sel.filter((o) => o.guid).map((o) => ({ modelId: o.modelId, id: o.id, guid: o.guid, label: (o.group && o.group.label) || (o.props && o.props[C.P.number]) || "" })),
+      onStatus: (text, bad) => setStatus(text, bad),
+    };
+    state.photos = opts;
+    opts.ui = ArstenPhotos.mount(opts);
+  }
+
   // ---------- rebar visibility ----------
   // Rebar as Tekla exports it to IFC. Hidden/shown with the viewer's own visibility ("Reset model" shows it again).
   const REBAR_CLASSES = ["IfcReinforcingBar", "IfcReinforcingMesh", "IfcTendon"];
@@ -437,6 +453,8 @@
     $("btnCsv").textContent = t("csv");
     $("hSummary").textContent = t("pours"); $("hOrphans").textContent = t("orphans"); $("hSplits").textContent = L2("Разделени тактове", "Split pours"); $("hMerges").textContent = L2("Обединени отново", "Merged back");
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
+    $("hPhotos").textContent = L2("Снимки", "Photos");
+    if (state.photos) { state.photos.lang = lang; state.photos.ui.render(); }
     $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
     $("lblColour").textContent = t("colour");
     $("lblHideRebar").textContent = t("hideRebar"); $("chkHideRebar").checked = !!state.rebarHidden;
@@ -700,6 +718,7 @@
     const inModel = state.objects.filter((o) => state.records.has(o.guid)).length, outside = state.records.size - inModel;
     loadProtection();
     if (state.rebarHidden) { state.rebarIds = null; await setRebarVisible(false); }   // keep "hide rebar" after a model reload
+    mountPhotos();
     setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}${outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : ""}`);
     render();
   }
