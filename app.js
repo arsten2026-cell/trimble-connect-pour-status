@@ -9,7 +9,7 @@
   const PROXY = "IfcBuildingElementProxy";
   const BATCH = 200;
   const T = {
-    title: ["Pour status · Статус тактове", "Pour status · Статус тактове"],
+    title: ["Монолитен бетон", "Cast-in-place concrete"],
     selection: ["Избрано", "Selection"], steps: ["Етапи", "Steps"], view: ["Изглед", "View"], pours: ["Тактове", "Pours"],
     fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], csv: ["Експорт Excel", "Export Excel"], clear: ["Изчисти", "Clear"],
     colour: ["Оцвети по статус", "Colour by status"], seeThrough: ["Незапочнатите прозрачни", "Not started see-through"], hideRebar: ["Скрий армировката", "Hide rebar"], orphans: ["Статус без обект", "Status without object"],
