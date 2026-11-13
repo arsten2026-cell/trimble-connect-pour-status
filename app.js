@@ -247,7 +247,7 @@
       canAdd: true, canDeleteAny: !!(state.access && state.access.role === "admin"), lang,
       targets: () => state.sel.filter((o) => o.guid).map((o) => ({ modelId: o.modelId, id: o.id, guid: o.guid, label: accPour(o) })),
       onStatus: (text, bad) => setStatus(text, bad),
-      purposes: window.ArstenAcceptance ? [{ id: "formwork", bg: "За приемане – Кофраж", en: "For acceptance – Formwork" }, { id: "rebar", bg: "За приемане – Армировка", en: "For acceptance – Rebar" }] : [],
+      purposes: window.ArstenAcceptance ? [{ id: "formwork", bg: "За приемане – Кофраж", en: "For acceptance – Formwork" }, { id: "rebar", bg: "За приемане – Армировка", en: "For acceptance – Rebar" }, { id: "both", bg: "За приемане – Кофраж и армировка", en: "For acceptance – Formwork and rebar" }] : [],
       onUploaded: (u) => guarded(() => acceptancePhotos(u)),
     };
     state.photos = opts;
@@ -298,7 +298,7 @@
       const s = A.STATUS[r.status] || A.STATUS.open;
       return `<div class="sub"><span class="sw" style="background:${s.colour}"></span>${esc(pour)} · ${esc(A.STEPS[step][lang])}: <b>${esc(s[lang])}</b>${r.status === "open" && !r.sent ? L2(" (неизпратена)", " (not sent)") : ""}${r.decided_by ? ` – ${esc(r.decided_by)} ${esc(r.decided)}` : ""}${r.comment ? `<br>„${esc(r.comment)}“` : ""}</div>`;
     };
-    box.innerHTML = pours.map((p) => row(p, "formwork") + row(p, "rebar")).join("")
+    box.innerHTML = pours.map((p) => row(p, "formwork") + row(p, "rebar") + row(p, "both")).join("")
       + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc">${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
     const b = $("btnSendAcc");
     if (b) b.onclick = () => guarded(sendAcceptance);

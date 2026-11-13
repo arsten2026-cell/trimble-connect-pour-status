@@ -15,7 +15,8 @@
   "use strict";
 
   const DEF_ID = "acceptance";
-  const STEPS = { formwork: { bg: "Кофраж", en: "Formwork" }, rebar: { bg: "Армировка", en: "Rebar" } };
+  // "both": formwork and rebar accepted in one go (e.g. foundations, user 13.11.2026); its decision covers both steps.
+  const STEPS = { formwork: { bg: "Кофраж", en: "Formwork" }, rebar: { bg: "Армировка", en: "Rebar" }, both: { bg: "Кофраж и армировка", en: "Formwork and rebar" } };
   const STATUS = {
     open: { bg: "Чака приемане", en: "Awaiting acceptance", colour: "#E37424" },
     approved: { bg: "Одобрено", en: "Approved", colour: "#2E7D32" },
@@ -114,10 +115,14 @@
   function latest(records, pour, step) {
     return records.filter((r) => r.pour === pour && r.step === step).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0] || null;
   }
+  /** Latest request that covers a step: its own requests and the combined "both" ones. */
+  function latestCovering(records, pour, step) {
+    return records.filter((r) => r.pour === pour && (r.step === step || r.step === "both")).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0] || null;
+  }
   /** Pours (labels) whose rebar is not approved (no request, open or rejected) – for the warning on "Излят". */
   function rebarNotApproved(records, pours) {
-    return [...new Set(pours)].filter((p) => { const r = latest(records, p, "rebar"); return !r || !(r.status === "approved" || r.status === "remarks"); });
+    return [...new Set(pours)].filter((p) => { const r = latestCovering(records, p, "rebar"); return !r || !(r.status === "approved" || r.status === "remarks"); });
   }
 
-  return { DEF_ID, STEPS, STATUS, APPROVER_GROUP, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, rebarNotApproved, parseObjects, ids };
+  return { DEF_ID, STEPS, STATUS, APPROVER_GROUP, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, latestCovering, rebarNotApproved, parseObjects, ids };
 });
