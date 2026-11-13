@@ -257,20 +257,27 @@
   // ---------- acceptance by the structural designer (shared/arsten-acceptance.js) ----------
   async function loadAcceptance() {
     if (!window.ArstenAcceptance || !state.lib) return;
-    try { await state.client.ensureDefinition(state.lib.id, ArstenAcceptance.definition()); } catch (e) { if (e.status !== 403) throw e; }
-    const m = await state.client.listAll(state.lib.id, ArstenAcceptance.DEF_ID, ArstenAcceptance.prefix(state.project.id));
-    state.acc = [...m].map(([link, p]) => Object.assign({ link }, p));
+    const A = ArstenAcceptance, lib = state.lib.id;
+    for (const d of [A.definition(), A.decisionDefinition()]) { try { await state.client.ensureDefinition(lib, d); } catch (e) { if (e.status !== 403) throw e; } }
+    const m = await state.client.listAll(lib, A.DEF_ID, A.prefix(state.project.id));
+    let dec = new Map();
+    try { dec = await state.client.listAll(lib, A.DEC_ID, A.prefix(state.project.id)); } catch (e) { if (e.status !== 404) throw e; }
+    // the status shown comes ONLY from the decisions (written by the 4.1 group), never from the request itself
+    state.acc = A.merge([...m].map(([link, p]) => Object.assign({ link }, p)), dec);
   }
   /** Change one request on its FRESH server copy and save it whole (replace, so cleared fields are cleared).
    *  change(fresh | null) returns the full record to save, or null to leave it. Returns the saved record or null. */
   async function saveAcc(link, change) {
-    const got = await state.client.readMany(state.lib.id, ArstenAcceptance.DEF_ID, [link]);
-    const fresh = got.has(link) ? Object.assign({ link }, got.get(link)) : null;
+    const A = ArstenAcceptance, lib = state.lib.id;
+    const got = await state.client.readMany(lib, A.DEF_ID, [link]);
+    let dec = new Map();
+    try { dec = await state.client.readMany(lib, A.DEC_ID, [link]); } catch (e) { if (e.status !== 404) throw e; }
+    const fresh = got.has(link) ? A.merge([Object.assign({ link }, got.get(link))], dec)[0] : null;
     const next = change(fresh);
     if (!next) return null;
-    const rec = Object.assign({}, next); delete rec.link;
-    await state.client.replace(state.lib.id, ArstenAcceptance.DEF_ID, link, rec);
-    const saved = Object.assign({ link }, rec);
+    const rec = A.reqProps(next);   // the contractor writes the REQUEST only; decisions are the 4.1 group's
+    await state.client.replace(lib, A.DEF_ID, link, rec);
+    const saved = A.merge([Object.assign({ link }, rec)], dec)[0];
     const i = (state.acc || []).findIndex((r) => r.link === link);
     if (i >= 0) state.acc[i] = saved; else (state.acc = state.acc || []).push(saved);
     return saved;

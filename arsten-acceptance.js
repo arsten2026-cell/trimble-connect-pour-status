@@ -6,7 +6,13 @@
 //    "4.1-STRUCTURAL DESIGNER" (only that group may approve: ArstenAccess capability "approve");
 //  - decision: approved / approved with remarks / rejected (remarks and rejection need a comment), with history;
 //  - Pour status only WARNS when "Излят" is marked while the rebar of that pour is not approved.
-// Records: definition "acceptance" in the pour library, link frn:entity:ARSTENACC-{projectId}-{id}. Pure, no network.
+// Records (pour library, link frn:entity:ARSTENACC-{projectId}-{id} for both):
+//   "acceptance"      the REQUEST, written by the contractor (step, pour, photos, objects, sent, ToDo, round, log);
+//   "acceptdecision"  the DECISION, written only by the 4.1 group – Library access control gives Edit on this definition
+//                     to "4.1-STRUCTURAL DESIGNER" only (server-side lock, user 13.11.2026). The status everyone sees comes
+//                     ONLY from here; the request's own status field is not trusted.
+// Rounds: a request starts at round 1; new photos after a rejection start the next round; a decision counts only for the
+// round it was made for, so a reopened request is "open" until the designer decides again. Pure, no network.
 (function (root, factory) {
   const lib = factory();
   if (typeof module === "object" && module.exports) module.exports = lib;
@@ -14,7 +20,7 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
-  const DEF_ID = "acceptance";
+  const DEF_ID = "acceptance", DEC_ID = "acceptdecision";
   // "both": formwork and rebar accepted in one go (e.g. foundations, user 13.11.2026); its decision covers both steps.
   const STEPS = { formwork: { bg: "Кофраж", en: "Formwork" }, rebar: { bg: "Армировка", en: "Rebar" }, both: { bg: "Кофраж и армировка", en: "Formwork and rebar" } };
   const STATUS = {
@@ -34,12 +40,40 @@
       ["requested", S, "Requested / Заявено"], ["requested_by", S, "Requested by / Заявил"],
       ["sent", S, "Sent / Изпратено"], ["todo_id", S, "ToDo"],
       ["decided", S, "Decided / Решено"], ["decided_by", S, "Decided by / Решил"], ["comment", S, "Comment / Коментар"],
-      ["log", S, "History / История"]];
+      ["log", S, "History / История"], ["round", S, "Round / Кръг"]];
     const props = {}, labels = {}, order = {};
     fields.forEach(([k, s, l], i) => { props[k] = s; labels[k] = l; order[k] = String(i); });
     return { id: DEF_ID, name: "Acceptance / Приемане", description: "Arsten acceptance of formwork / rebar (structural designer).", schema: { props },
       i18n: { "en-US": { name: "Acceptance / Приемане", props: labels }, "__prop-order__": { name: "__prop-order__", props: order } } };
   }
+  /** Decisions: only the 4.1 group has Edit on this definition (set in Connect's Library access control). */
+  function decisionDefinition() {
+    const S = { type: "string" };
+    const fields = [["status", S, "Decision / Решение"], ["round", S, "Round / Кръг"], ["decided", S, "Decided / Решено"],
+      ["decided_by", S, "Decided by / Решил"], ["comment", S, "Comment / Коментар"], ["log", S, "History / История"]];
+    const props = {}, labels = {}, order = {};
+    fields.forEach(([k, s, l], i) => { props[k] = s; labels[k] = l; order[k] = String(i); });
+    return { id: DEC_ID, name: "Acceptance decision / Решение за приемане", description: "Decisions of the structural designer (4.1-STRUCTURAL DESIGNER only).", schema: { props },
+      i18n: { "en-US": { name: "Acceptance decision / Решение за приемане", props: labels }, "__prop-order__": { name: "__prop-order__", props: order } } };
+  }
+  const DECISIONS = ["approved", "remarks", "rejected"];
+  const REQ_FIELDS = ["step", "pour", "photos", "objects", "requested", "requested_by", "sent", "todo_id", "round", "log"];
+  const roundOf = (r) => String((r && r.round) || "1");
+  /**
+   * Requests + decisions -> what everyone sees. status/decided/decided_by/comment come ONLY from a decision for the
+   * request's current round; otherwise the request is "open". declog = the decision's own history.
+   * @param requests [{link, ...request props}]  @param decisions Map link -> decision props
+   */
+  function merge(requests, decisions) {
+    return requests.map((q) => {
+      const d = decisions && decisions.get(q.link);
+      const counts = !!(d && DECISIONS.includes(d.status) && roundOf(d) === roundOf(q));
+      return Object.assign({}, q, { round: roundOf(q), status: counts ? d.status : "open", decided: counts ? d.decided || "" : "",
+        decided_by: counts ? d.decided_by || "" : "", comment: counts ? d.comment || "" : "", declog: (d && d.log) || "" });
+    });
+  }
+  /** The request record to save (request fields only; its status is always "open"). */
+  const reqProps = (r) => { const o = { status: "open" }; for (const k of REQ_FIELDS) if (r[k] != null) o[k] = r[k]; return o; };
   const prefix = (projectId) => `frn:entity:ARSTENACC-${projectId}-`;
   const link = (projectId, id) => prefix(projectId) + id;
 
@@ -54,7 +88,7 @@
    *  change to that fresh copy and save it with replace().
    *  The whole record to write (all fields, without the link). Every write sends the full record: pset-api can merge a
    *  PATCH onto a stale copy when two writes come seconds apart, which lost a request's fields live on 13.11.2026. */
-  const full = (r, props) => { const o = Object.assign({}, r, props); delete o.link; return o; };
+  const full = (r, props) => reqProps(Object.assign({}, r, props));
   /** A usable request (old broken records without pour/step are skipped). */
   const valid = (r) => !!(r && r.pour && STEPS[r.step]);
 
@@ -76,15 +110,15 @@
         for (const o of objs) if (!objects.some((x) => x.guid === o.guid)) objects.push({ modelId: o.modelId, guid: o.guid, label: pour });
         const props = { photos: [...new Set([...ids(cur.photos), ...p.photoIds])].join(","), objects: JSON.stringify(objects) };
         let line = `${stamp(now)} photos +${p.photoIds.length} by ${p.by || "?"}`;
-        if (cur.status === "rejected") { Object.assign(props, { status: "open", sent: "", todo_id: "", decided: "", decided_by: "", comment: "" }); line += " – reopened after rejection"; }
+        if (cur.status === "rejected") { Object.assign(props, { round: String(+roundOf(cur) + 1), sent: "", todo_id: "" }); line += ` – reopened after rejection (round ${props.round})`; }
         props.log = addLog(cur.log, line);
         writes.push({ link: cur.link, props: full(cur, props), created: false });
       } else {
         const id = p.newId();
         writes.push({ link: link(p.projectId, id), created: true, props: {
-          step: p.step, pour, status: "open", photos: p.photoIds.join(","),
+          step: p.step, pour, status: "open", round: "1", photos: p.photoIds.join(","),
           objects: JSON.stringify(objs.map((o) => ({ modelId: o.modelId, guid: o.guid, label: pour }))),
-          requested: stamp(now), requested_by: p.by || "", sent: "", todo_id: "", decided: "", decided_by: "", comment: "",
+          requested: stamp(now), requested_by: p.by || "", sent: "", todo_id: "",
           log: `${stamp(now)} requested (${p.step}, ${p.photoIds.length} photos) by ${p.by || "?"}` } });
       }
     }
@@ -109,14 +143,15 @@
   /** Props to write on each request once the ToDo exists. */
   const markSent = (r, todoId, by, now) => full(r, { sent: stamp(now || new Date()), todo_id: todoId || "", log: addLog(r.log, `${stamp(now || new Date())} sent to the designer by ${by || "?"}${todoId ? " (ToDo " + todoId + ")" : ""}`) });
 
-  /** Decision by the approver. remarks / rejected need a comment. Returns the props to write. */
+  /** Decision by the approver (r = merged record). remarks / rejected need a comment. Returns the DECISION record to
+   *  write (definition "acceptdecision", same link), for the request's current round. */
   function decide(r, d) {
-    if (!STATUS[d.decision] || d.decision === "open") throw new Error("unknown decision " + d.decision);
+    if (!DECISIONS.includes(d.decision)) throw new Error("unknown decision " + d.decision);
     const comment = String(d.comment || "").trim();
     if ((d.decision === "remarks" || d.decision === "rejected") && !comment) throw Object.assign(new Error("comment required"), { code: "comment" });
     const now = d.now || new Date();
-    return full(r, { status: d.decision, decided: stamp(now), decided_by: d.by || "", comment,
-      log: addLog(r.log, `${stamp(now)} ${d.decision} by ${d.by || "?"}${comment ? " – " + comment : ""}`) });
+    return { status: d.decision, round: roundOf(r), decided: stamp(now), decided_by: d.by || "", comment,
+      log: addLog(r.declog, `${stamp(now)} round ${roundOf(r)}: ${d.decision} by ${d.by || "?"}${comment ? " – " + comment : ""}`) };
   }
 
   /** Latest request of a pour and step (or null). */
@@ -151,5 +186,5 @@
     return [...new Set(pours)].filter((p) => { const r = latestCovering(records, p, "rebar"); return !r || !(r.status === "approved" || r.status === "remarks"); });
   }
 
-  return { DEF_ID, STEPS, STATUS, APPROVER_GROUP, full, valid, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, latestCovering, pourStates, rebarNotApproved, parseObjects, ids };
+  return { DEF_ID, DEC_ID, STEPS, STATUS, APPROVER_GROUP, full, valid, merge, reqProps, decisionDefinition, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, latestCovering, pourStates, rebarNotApproved, parseObjects, ids };
 });
