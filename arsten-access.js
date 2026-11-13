@@ -37,7 +37,7 @@
     "VIEWERS": "viewer",
   };
   /** Which roles may use which kind of extension. Roles not listed anywhere have no access. */
-  const APPS = { execution: ["admin", "gc"], admin: ["admin"], projectStatus: ["admin", "client", "gc"] };   // projectStatus: GC too (user, 12.11)
+  const APPS = { execution: ["admin", "gc"], admin: ["admin"], projectStatus: ["admin", "client", "gc"], assembly: ["admin", "gc", "designer"] };   // projectStatus: GC too (user, 12.11)
   /** When someone is in several groups, the first role in this order wins. */
   const ROLE_ORDER = ["admin", "gc", "client", "subcontractor", "designer", "viewer"];
   const DEFAULTS = { groupRoles: GROUP_ROLES, apps: APPS, cacheMinutes: 10 };

@@ -232,17 +232,31 @@
   // ---------- rebar visibility ----------
   // Rebar as Tekla exports it to IFC. Hidden/shown with the viewer's own visibility ("Reset model" shows it again).
   const REBAR_CLASSES = ["IfcReinforcingBar", "IfcReinforcingMesh", "IfcTendon"];
-  async function setRebarVisible(visible) {
-    let n = 0;
-    for (const cls of REBAR_CLASSES) {
-      let found;
-      try { found = await state.api.viewer.getObjects({ parameter: { class: cls } }); } catch { continue; }
-      const ids = (found || []).filter((m) => (m.objects || []).length).map((m) => ({ modelId: m.modelId, objectRuntimeIds: m.objects.map((o) => o.id) }));
-      if (!ids.length) continue;
-      n += ids.reduce((t, m) => t + m.objectRuntimeIds.length, 0);
-      await state.api.viewer.setObjectState({ modelObjectIds: ids }, { visible });
+  // Not via Connect's native class filter: live it returned nothing for these classes (1028 exports, 2026-11-13), so the
+  // tick box did nothing. Read every object's class instead; done once per loaded model set (reset on model change).
+  async function rebarIds() {
+    if (state.rebarIds) return state.rebarIds;
+    const api = state.api, byModel = new Map();
+    const add = (modelId, ids) => { if (!byModel.has(modelId)) byModel.set(modelId, []); byModel.get(modelId).push(...ids); };
+    {
+      const re = new RegExp(`^(${REBAR_CLASSES.join("|")})$`, "i");
+      for (const m of (await api.viewer.getObjects()) || []) {
+        const ids = (m.objects || []).map((o) => o.id);
+        for (let i = 0; i < ids.length; i += BATCH) {
+          setStatus(L2(`Търся армировката… ${i} от ${ids.length}`, `Finding rebar… ${i} of ${ids.length}`));
+          const props = (await api.viewer.getObjectProperties(m.modelId, ids.slice(i, i + BATCH))) || [];
+          add(m.modelId, props.filter((p) => re.test(String(p.class || ""))).map((p) => p.id));
+        }
+      }
     }
-    return n;
+    state.rebarIds = [...byModel].filter(([, ids]) => ids.length).map(([modelId, ids]) => ({ modelId, objectRuntimeIds: [...new Set(ids)] }));
+    return state.rebarIds;
+  }
+  async function setRebarVisible(visible) {
+    const ids = await rebarIds();
+    if (!ids.length) return 0;
+    await state.api.viewer.setObjectState({ modelObjectIds: ids }, { visible });
+    return ids.reduce((t, m) => t + m.objectRuntimeIds.length, 0);
   }
 
   // ---------- colours ----------
@@ -685,6 +699,7 @@
     $("mainBox").hidden = false;
     const inModel = state.objects.filter((o) => state.records.has(o.guid)).length, outside = state.records.size - inModel;
     loadProtection();
+    if (state.rebarHidden) { state.rebarIds = null; await setRebarVisible(false); }   // keep "hide rebar" after a model reload
     setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}${outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : ""}`);
     render();
   }
@@ -705,7 +720,7 @@
     if (event === "extension.accessToken") onToken(data);
     if (state.denied) return;
     if (event === "viewer.onSelectionChanged") onViewerSelection();
-    if (event === "viewer.onModelStateChanged" && state.api) { state.objects = []; state.sel = []; guarded(start2); }
+    if (event === "viewer.onModelStateChanged" && state.api) { state.objects = []; state.sel = []; state.rebarIds = null; guarded(start2); }
   }
   if (window.parent === window) {
     if (/[?&]demo\b/.test(location.search)) { const s = document.createElement("script"); s.src = "demo.js?t=" + Date.now(); document.body.appendChild(s); }
