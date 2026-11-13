@@ -142,7 +142,8 @@
   .ph-box{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:50;display:flex;flex-direction:column;padding:8px;color:#fff}
   .ph-box img{flex:1;min-height:0;object-fit:contain;width:100%}
   .ph-box .ph-meta{font-size:12px;padding:6px 0}
-  .ph-box .ph-acts{display:flex;gap:6px;flex-wrap:wrap}
+  .ph-box .ph-acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:space-between;align-items:center}
+  .ph-box .ph-acts .ph-r{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
   .ph-box button{background:#fff;color:#1f1f1f;border-color:#fff}
   .ph-box button.ph-bad{background:#b3261e;color:#fff;border-color:#b3261e}`;
 
@@ -294,7 +295,8 @@
     async function remove(r) {
       for (const id of String(r.links || "").split(",").filter(Boolean)) { try { await core.req(`objectlink/${encodeURIComponent(id)}`, "DELETE"); } catch {} }
       try { await core.req(`files/${encodeURIComponent(r.file_id)}`, "DELETE"); } catch (e) { if (e.status !== 404) throw e; }
-      await opts.client.write(opts.libId, DEF_ID, r.link, { deleted: true, links: "" });
+      const rec = Object.assign({}, r, { deleted: true, links: "" }); delete rec.link;   // full record (see ArstenAcceptance.full)
+      await opts.client.write(opts.libId, DEF_ID, r.link, rec);
       r.deleted = true;
       st.open = null; st.confirm = false;
       render();
@@ -338,7 +340,7 @@
       return `<div class="ph-box"><img alt="" data-src="${esc(r.file_id)}">
         <div class="ph-meta"><b>${esc(r.labels)}</b>${r.purpose ? ` · ${esc(((opts.purposes || []).find((p) => p.id === r.purpose) || {})[opts.lang === "en" ? "en" : "bg"] || r.purpose)}` : ""}${r.caption ? " – " + esc(r.caption) : ""}<br>${esc(r.taken.replace("T", " ").slice(0, 16))} · ${esc(r.by)} · ${esc(r.size)} · ${r.links ? l.native : l.noNative}</div>
         <div class="ph-acts">${st.confirm ? `<span>${l.delAsk}</span><button class="small ph-bad" data-pha="yes">${l.yes}</button><button class="small" data-pha="no">${l.no}</button>`
-          : `<button class="small" data-pha="show">${l.show}</button>${canDelete(r) ? `<button class="small ph-bad" data-pha="del">${l.del}</button>` : ""}<button class="small" data-pha="close">${l.close}</button>`}</div></div>`;
+          : `${canDelete(r) ? `<button class="small ph-bad" data-pha="del">${l.del}</button>` : ""}<span class="ph-r"><button class="small" data-pha="show">${l.show}</button><button class="small" data-pha="close">${l.close}</button></span>`}</div></div>`;
     }
     function wire() {
       const el = opts.el, g = (fn) => () => Promise.resolve().then(fn).catch((e) => say(e.message, true));

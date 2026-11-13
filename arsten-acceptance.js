@@ -49,6 +49,11 @@
   const ids = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
   const parseObjects = (s) => { try { const a = JSON.parse(s || "[]"); return Array.isArray(a) ? a : []; } catch { return []; } };
   const isLive = (r) => r.status === "open" || r.status === "rejected";
+  /** The whole record to write (all fields, without the link). Every write sends the full record: pset-api can merge a
+   *  PATCH onto a stale copy when two writes come seconds apart, which lost a request's fields live on 13.11.2026. */
+  const full = (r, props) => { const o = Object.assign({}, r, props); delete o.link; return o; };
+  /** A usable request (old broken records without pour/step are skipped). */
+  const valid = (r) => !!(r && r.pour && STEPS[r.step]);
 
   /**
    * New photos for acceptance. One request per pour label and step: joins a live (open/rejected) one, else a new one.
@@ -62,7 +67,7 @@
     for (const o of p.objects) { const k = String(o.label || "").trim() || "?"; if (!byPour.has(k)) byPour.set(k, []); byPour.get(k).push(o); }
     const writes = [];
     for (const [pour, objs] of byPour) {
-      const cur = records.filter((r) => r.step === p.step && r.pour === pour && isLive(r)).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0];
+      const cur = records.filter((r) => valid(r) && r.step === p.step && r.pour === pour && isLive(r)).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0];
       if (cur) {
         const objects = parseObjects(cur.objects);
         for (const o of objs) if (!objects.some((x) => x.guid === o.guid)) objects.push({ modelId: o.modelId, guid: o.guid, label: pour });
@@ -70,7 +75,7 @@
         let line = `${stamp(now)} photos +${p.photoIds.length} by ${p.by || "?"}`;
         if (cur.status === "rejected") { props.status = "open"; props.sent = ""; props.todo_id = ""; line += " – reopened after rejection"; }
         props.log = addLog(cur.log, line);
-        writes.push({ link: cur.link, props, created: false });
+        writes.push({ link: cur.link, props: full(cur, props), created: false });
       } else {
         const id = p.newId();
         writes.push({ link: link(p.projectId, id), created: true, props: {
@@ -84,7 +89,7 @@
   }
 
   /** Open requests not yet sent to the designer. */
-  const toSend = (records) => records.filter((r) => r.status === "open" && !r.sent);
+  const toSend = (records) => records.filter((r) => valid(r) && r.status === "open" && !r.sent);
 
   /** ONE ToDo for all of them, assigned to the approver group. */
   function todoBody(requests, p) {
@@ -99,7 +104,7 @@
     };
   }
   /** Props to write on each request once the ToDo exists. */
-  const markSent = (r, todoId, by, now) => ({ sent: stamp(now || new Date()), todo_id: todoId || "", log: addLog(r.log, `${stamp(now || new Date())} sent to the designer by ${by || "?"}${todoId ? " (ToDo " + todoId + ")" : ""}`) });
+  const markSent = (r, todoId, by, now) => full(r, { sent: stamp(now || new Date()), todo_id: todoId || "", log: addLog(r.log, `${stamp(now || new Date())} sent to the designer by ${by || "?"}${todoId ? " (ToDo " + todoId + ")" : ""}`) });
 
   /** Decision by the approver. remarks / rejected need a comment. Returns the props to write. */
   function decide(r, d) {
@@ -107,22 +112,22 @@
     const comment = String(d.comment || "").trim();
     if ((d.decision === "remarks" || d.decision === "rejected") && !comment) throw Object.assign(new Error("comment required"), { code: "comment" });
     const now = d.now || new Date();
-    return { status: d.decision, decided: stamp(now), decided_by: d.by || "", comment,
-      log: addLog(r.log, `${stamp(now)} ${d.decision} by ${d.by || "?"}${comment ? " – " + comment : ""}`) };
+    return full(r, { status: d.decision, decided: stamp(now), decided_by: d.by || "", comment,
+      log: addLog(r.log, `${stamp(now)} ${d.decision} by ${d.by || "?"}${comment ? " – " + comment : ""}`) });
   }
 
   /** Latest request of a pour and step (or null). */
   function latest(records, pour, step) {
-    return records.filter((r) => r.pour === pour && r.step === step).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0] || null;
+    return records.filter((r) => valid(r) && r.pour === pour && r.step === step).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0] || null;
   }
   /** Latest request that covers a step: its own requests and the combined "both" ones. */
   function latestCovering(records, pour, step) {
-    return records.filter((r) => r.pour === pour && (r.step === step || r.step === "both")).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0] || null;
+    return records.filter((r) => valid(r) && r.pour === pour && (r.step === step || r.step === "both")).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0] || null;
   }
   /** Pours (labels) whose rebar is not approved (no request, open or rejected) – for the warning on "Излят". */
   function rebarNotApproved(records, pours) {
     return [...new Set(pours)].filter((p) => { const r = latestCovering(records, p, "rebar"); return !r || !(r.status === "approved" || r.status === "remarks"); });
   }
 
-  return { DEF_ID, STEPS, STATUS, APPROVER_GROUP, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, latestCovering, rebarNotApproved, parseObjects, ids };
+  return { DEF_ID, STEPS, STATUS, APPROVER_GROUP, full, valid, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, latestCovering, rebarNotApproved, parseObjects, ids };
 });
