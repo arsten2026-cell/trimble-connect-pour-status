@@ -114,6 +114,30 @@
     return { req };
   }
 
+
+  /**
+   * Which photo files still exist. A photo deleted directly in Connect (Data explorer / Attachments) leaves our record
+   * behind; such photos are hidden. Reads one folder listing per day (_ArstenDocs/Photos/<day>). Returns a Set of
+   * existing file ids, or null when the folders cannot be read (then nothing is hidden).
+   */
+  async function existingIds(core, projectId, records) {
+    const days = [...new Set(records.filter((r) => !r.deleted).map((r) => r.day || String(r.taken || "").slice(0, 10)).filter(Boolean))];
+    if (!days.length) return new Set();
+    const list = async (id) => { const it = (await core.req(`folders/${encodeURIComponent(id)}/items`)) || []; return Array.isArray(it) ? it : it.items || []; };
+    const child = (items, name) => items.find((x) => String(x.type).toUpperCase() === "FOLDER" && x.name === name);
+    try {
+      const p = await core.req(`projects/${encodeURIComponent(projectId)}`);
+      let folder = { id: p.rootId };
+      for (const name of ROOT_PATH) { folder = child(await list(folder.id), name); if (!folder) return new Set(); }
+      const dayFolders = await list(folder.id), out = new Set();
+      for (const day of days) {
+        const f = child(dayFolders, day);
+        if (f) for (const x of await list(f.id)) if (String(x.type).toUpperCase() !== "FOLDER") out.add(x.id);
+      }
+      return out;
+    } catch (e) { console.warn("photo files could not be checked", e); return null; }
+  }
+
   // ---------- image ----------
   async function prepareImage(file) {
     const buf = await file.slice(0, 256 * 1024).arrayBuffer();   // EXIF sits at the start; no need to read the whole photo
@@ -187,13 +211,13 @@
       needSel: "Изберете обект(и) в модела, за да добавите снимки към тях.", to: "Към", sel: "За избраното", all: "Всички по дни", filter: "Филтър (такт / марка)",
       none: "Няма снимки.", noneSel: "Няма снимки за избраното.", up: "Качване", done: "качена", fail: "грешка", show: "Покажи в модела", del: "Изтрий",
       delAsk: "Да се изтрие ли снимката? Това не може да се отмени.", yes: "Да, изтрий", no: "Не", close: "Затвори", orig: "оригинал",
-      markFor: "За приемане…", pick: "Избери", pickDone: "Отказ", picked: "Избрани", apply: "Приложи", choosePurpose: "Изберете за какво (кофраж / армировка).",
+      gone: "{n} снимки са изтрити в Connect и са скрити.", markFor: "За приемане…", pick: "Избери", pickDone: "Отказ", picked: "Избрани", apply: "Приложи", choosePurpose: "Изберете за какво (кофраж / армировка).",
       native: "Връзка в Connect", openNew: "Отвори в нов прозорец", zoom: "Щракнете за увеличение", noNative: "без връзка в Connect (само в нашия списък)", loading: "Зареждане…" },
     en: { title: "Photos", add: "Add photos", camera: "Camera", drop: "Drop photos here or choose files", caption: "Caption (optional)",
       needSel: "Select object(s) in the model to add photos to them.", to: "To", sel: "For the selection", all: "All by day", filter: "Filter (pour / mark)",
       none: "No photos.", noneSel: "No photos for the selection.", up: "Uploading", done: "uploaded", fail: "failed", show: "Show in model", del: "Delete",
       delAsk: "Delete this photo? This cannot be undone.", yes: "Yes, delete", no: "No", close: "Close", orig: "original",
-      markFor: "For acceptance…", pick: "Select", pickDone: "Cancel", picked: "Selected", apply: "Apply", choosePurpose: "Choose what for (formwork / rebar).",
+      gone: "{n} photos were deleted in Connect and are hidden.", markFor: "For acceptance…", pick: "Select", pickDone: "Cancel", picked: "Selected", apply: "Apply", choosePurpose: "Choose what for (formwork / rebar).",
       native: "Linked in Connect", openNew: "Open in new window", zoom: "Click to zoom", noNative: "not linked in Connect (our list only)", loading: "Loading…" },
   };
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -219,6 +243,13 @@
       st.records = [...m].map(([link, p]) => Object.assign({ link }, p));
       st.loaded = true;
       render();
+      // photos whose file was deleted in Connect itself are hidden (our record stays, marked "gone" only here)
+      const exist = await existingIds(core, opts.project.id, st.records);
+      if (exist) {
+        let gone = 0;
+        for (const r of st.records) if (!r.deleted && r.file_id && !exist.has(r.file_id)) { r.deleted = true; r.gone = true; gone++; }
+        if (gone) { say(L().gone.replace("{n}", gone)); render(); }
+      }
     }
 
     // folders _ArstenDocs/Photos/<day>, created when missing
@@ -460,5 +491,5 @@
     return { render, reload: load, state: st };
   }
 
-  return { DEF_ID, wireZoom, definition, photoPrefix, photoLink, fileName, exifDate, groupByDay, forObjects, parseObjects, fmtSize, coreClient, prepareImage, mount };
+  return { DEF_ID, wireZoom, existingIds, definition, photoPrefix, photoLink, fileName, exifDate, groupByDay, forObjects, parseObjects, fmtSize, coreClient, prepareImage, mount };
 });
