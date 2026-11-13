@@ -222,9 +222,13 @@
       for (const o of objs) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.guid); }
       for (const [modelId, guids] of byModel) {
         const m = models.find((x) => x.id === modelId) || {};
-        const body = { source: { id: modelId, versionId: m.versionId || undefined, modelId, data: guids.map((g) => ({ sourceId: g, type: "BIMOBJECT" })) },
-          target: { id: fileId, type: "FILE" } };
-        const r = await core.req("objectlink", "POST", body);
+        const data = guids.map((g) => ({ sourceId: g, type: "BIMOBJECT" }));
+        const target = { id: fileId, type: "FILE" };
+        // Plain model file: source = {file id, version}. With "modelId" Connect answers 400 "Object link modelId is not
+        // enabled" (live 1028, 13.11.2026); the web app adds modelId only for another kind of model, so it is the fallback.
+        let r;
+        try { r = await core.req("objectlink", "POST", { source: { id: modelId, versionId: m.versionId || undefined, data }, target }); }
+        catch (e) { if (e.status !== 400) throw e; r = await core.req("objectlink", "POST", { source: { id: modelId, versionId: m.versionId || undefined, modelId, data }, target }); }
         const id = r && (r.id || (Array.isArray(r) && r[0] && r[0].id));
         if (id) out.push(id);
       }
