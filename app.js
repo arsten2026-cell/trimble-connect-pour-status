@@ -261,20 +261,39 @@
     const m = await state.client.listAll(state.lib.id, ArstenAcceptance.DEF_ID, ArstenAcceptance.prefix(state.project.id));
     state.acc = [...m].map(([link, p]) => Object.assign({ link }, p));
   }
+  /** Change one request on its FRESH server copy and save it whole (replace, so cleared fields are cleared).
+   *  change(fresh | null) returns the full record to save, or null to leave it. Returns the saved record or null. */
+  async function saveAcc(link, change) {
+    const got = await state.client.readMany(state.lib.id, ArstenAcceptance.DEF_ID, [link]);
+    const fresh = got.has(link) ? Object.assign({ link }, got.get(link)) : null;
+    const next = change(fresh);
+    if (!next) return null;
+    const rec = Object.assign({}, next); delete rec.link;
+    await state.client.replace(state.lib.id, ArstenAcceptance.DEF_ID, link, rec);
+    const saved = Object.assign({ link }, rec);
+    const i = (state.acc || []).findIndex((r) => r.link === link);
+    if (i >= 0) state.acc[i] = saved; else (state.acc = state.acc || []).push(saved);
+    return saved;
+  }
+  let accBusy = false;
   async function acceptancePhotos(u) {
+    // fresh list first, so photos join a request someone else opened meanwhile instead of creating a second one
+    try { await loadAcceptance(); } catch (e) { throw new Error(L2("Заявките за приемане не можаха да се заредят: ", "Acceptance requests could not be loaded: ") + ((e && e.message) || e)); }
     const { writes } = ArstenAcceptance.attachPhotos(state.acc || [], { projectId: state.project.id, step: u.purpose, objects: u.objects, photoIds: u.fileIds,
       by: state.user, newId: () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6) });
-    for (const w of writes) {
-      await state.client.write(state.lib.id, ArstenAcceptance.DEF_ID, w.link, w.props);
-      const cur = (state.acc || []).find((r) => r.link === w.link);
-      if (cur) Object.assign(cur, w.props); else (state.acc = state.acc || []).push(Object.assign({ link: w.link }, w.props));
-    }
+    for (const w of writes) await saveAcc(w.link, () => w.props);
     setStatus(L2(`Заявка за приемане: ${writes.length} (изпратете с „Изпрати за приемане“)`, `Acceptance requests: ${writes.length} (send with "Send for acceptance")`));
     render();
   }
   async function sendAcceptance() {
+    if (accBusy) return;
+    accBusy = true;
+    try { await sendAcceptanceNow(); } finally { accBusy = false; render(); }
+  }
+  async function sendAcceptanceNow() {
+    await loadAcceptance();   // fresh: someone may have decided or sent meanwhile
     const list = ArstenAcceptance.toSend(state.acc || []);
-    if (!list.length) return;
+    if (!list.length) { render(); return setStatus(L2("Няма неизпратени заявки.", "Nothing left to send.")); }
     const data = await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
     const g = (data.groups || []).find((x) => ArstenAccess.groupKey(x.name) === ArstenAccess.groupKey(ArstenAcceptance.APPROVER_GROUP));
     if (!g) return setStatus(L2("Няма група „4.1-STRUCTURAL DESIGNER“ в проекта.", "No group 4.1-STRUCTURAL DESIGNER in the project."), true);
@@ -282,14 +301,15 @@
     const body = ArstenAcceptance.todoBody(list, { projectId: state.project.id, groupId: g.id, lang });
     const todo = await core.req("todos", "POST", body);
     const todoId = (todo && (todo.id || todo.todoId)) || "";
-    for (const r of list) { const props = ArstenAcceptance.markSent(r, todoId, state.user); await state.client.write(state.lib.id, ArstenAcceptance.DEF_ID, r.link, props); Object.assign(r, props); }
+    for (const r of list) await saveAcc(r.link, (fresh) => (fresh && fresh.status === "open" && !fresh.sent ? ArstenAcceptance.markSent(fresh, todoId, state.user) : null));
     setStatus(L2(`Изпратено за приемане: ${list.length} (една задача в Connect)`, `Sent for acceptance: ${list.length} (one Connect ToDo)`));
     render();
   }
   function renderAcceptance() {
     const box = $("accBox");
     if (!box) return;
-    if (!window.ArstenAcceptance || !state.acc) { box.innerHTML = ""; return; }
+    if (!window.ArstenAcceptance) { box.innerHTML = ""; return; }
+    if (!state.acc) { box.innerHTML = state.accError ? `<div class="sub bad">${esc(L2("Заявките за приемане не се заредиха: ", "Acceptance requests did not load: ") + state.accError)}</div>` : ""; return; }
     const A = ArstenAcceptance, pend = A.toSend(state.acc);
     const pours = [...new Set(state.sel.map(accPour))];
     const row = (pour, step) => {
@@ -299,7 +319,7 @@
       return `<div class="sub"><span class="sw" style="background:${s.colour}"></span>${esc(pour)} · ${esc(A.STEPS[step][lang])}: <b>${esc(s[lang])}</b>${r.status === "open" && !r.sent ? L2(" (неизпратена)", " (not sent)") : ""}${r.decided_by ? ` – ${esc(r.decided_by)} ${esc(r.decided)}` : ""}${r.comment ? `<br>„${esc(r.comment)}“` : ""}</div>`;
     };
     box.innerHTML = pours.map((p) => row(p, "formwork") + row(p, "rebar") + row(p, "both")).join("")
-      + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc">${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
+      + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc"${accBusy ? " disabled" : ""}>${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
     const b = $("btnSendAcc");
     if (b) b.onclick = () => guarded(sendAcceptance);
   }
@@ -778,7 +798,7 @@
     const inModel = state.objects.filter((o) => state.records.has(o.guid)).length, outside = state.records.size - inModel;
     loadProtection();
     if (state.rebarHidden) { state.rebarIds = null; await setRebarVisible(false); }   // keep "hide rebar" after a model reload
-    try { await loadAcceptance(); } catch (e) { console.error(e); }
+    try { await loadAcceptance(); state.accError = ""; } catch (e) { console.error(e); state.accError = (e && e.message) || String(e); }
     mountPhotos();
     setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}${outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : ""}`);
     render();

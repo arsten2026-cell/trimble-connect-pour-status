@@ -116,16 +116,24 @@
 
   // ---------- image ----------
   async function prepareImage(file) {
-    const buf = await file.arrayBuffer();
+    const buf = await file.slice(0, 256 * 1024).arrayBuffer();   // EXIF sits at the start; no need to read the whole photo
     const taken = exifDate(buf) || (file.lastModified ? new Date(file.lastModified) : new Date());
     let bmp;
-    try { bmp = await createImageBitmap(file, { imageOrientation: "from-image" }); } catch { bmp = await createImageBitmap(file); }
+    try { bmp = await createImageBitmap(file, { imageOrientation: "from-image" }); }
+    catch {
+      try { bmp = await createImageBitmap(file); }
+      catch { throw new Error(/\.hei[cf]$/i.test(file.name) || /hei[cf]/i.test(file.type) ? "HEIC не се поддържа на този компютър – изберете JPEG / HEIC not supported here, use JPEG" : "Файлът не може да се отвори като снимка / not a readable image"); }
+    }
     const k = Math.min(1, MAX_PX / Math.max(bmp.width, bmp.height));
     const w = Math.round(bmp.width * k), h = Math.round(bmp.height * k);
     const c = document.createElement("canvas"); c.width = w; c.height = h;
-    c.getContext("2d").drawImage(bmp, 0, 0, w, h);
+    const ctx = c.getContext("2d");
+    if (!ctx) { if (bmp.close) bmp.close(); throw new Error("Няма памет за снимката – качете по-малко наведнъж / out of memory, upload fewer at once"); }
+    ctx.drawImage(bmp, 0, 0, w, h);
     if (bmp.close) bmp.close();
     const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", JPEG_Q));
+    c.width = 0; c.height = 0;   // give the canvas memory back at once (iOS has a total canvas limit)
+    if (!blob) throw new Error("Снимката не можа да се компресира – опитайте пак / could not compress the photo");
     return { blob, taken, w, h, originalSize: file.size, size: blob.size, name: file.name };
   }
 
@@ -214,7 +222,12 @@
     }
 
     // folders _ArstenDocs/Photos/<day>, created when missing
-    async function folderFor(day) {
+    const folderJobs = new Map();
+    function folderFor(day) {   // memoised as a promise: parallel uploads of the same day share one lookup / create
+      if (!folderJobs.has(day)) folderJobs.set(day, folderLookup(day).catch((e) => { folderJobs.delete(day); throw e; }));
+      return folderJobs.get(day);
+    }
+    async function folderLookup(day) {
       if (st.folders.has(day)) return st.folders.get(day);
       let parent = st.rootId;
       if (!parent) { const p = await core.req(`projects/${encodeURIComponent(opts.project.id)}`); parent = st.rootId = p.rootId; }
@@ -275,9 +288,11 @@
       const purpose = ((opts.el.querySelector(".ph-purpose") || {}).value || "");
       const uploaded = [];
       const list = [...files].filter((f) => /^image\//.test(f.type) || /\.(jpe?g|png|heic|webp)$/i.test(f.name));
-      for (const f of list) st.queue.push({ name: f.name, state: L().up + "…", file: f });
+      const mine = list.map((f) => ({ name: f.name, state: L().up + "…", file: f }));
+      st.queue.push(...mine);
+      st.caption = "";
       render();
-      for (const q of st.queue.filter((x) => x.file)) {
+      for (const q of mine) {
         const file = q.file; q.file = null;
         try {
           const img = await prepareImage(file);
@@ -304,7 +319,8 @@
 
     async function urlOf(r) {
       if (st.urls.has(r.file_id)) return st.urls.get(r.file_id);
-      const p = core.req(`files/fs/${encodeURIComponent(r.file_id)}/downloadurl`).then((d) => (d && (d.url || d.downloadUrl || d.href)) || "");
+      const p = core.req(`files/fs/${encodeURIComponent(r.file_id)}/downloadurl`).then((d) => (d && (d.url || d.downloadUrl || d.href)) || "")
+        .catch((e) => { st.urls.delete(r.file_id); throw e; });
       st.urls.set(r.file_id, p);
       return p;
     }
@@ -376,7 +392,7 @@
         ${opts.canAdd ? `<div class="ph-drop">${objs.length ? `<div>${l.to}: <b>${esc(labels.join(", ") || objs.length)}</b> (${objs.length})</div>` : `<div>${l.needSel}</div>`}
           <div>${l.drop}</div>
           ${(opts.purposes || []).length ? `<div class="bar" style="justify-content:center"><select class="ph-purpose"><option value="">${opts.lang === "en" ? "General" : "Обща"}</option>${opts.purposes.map((p) => `<option value="${esc(p.id)}"${st.purpose === p.id ? " selected" : ""}>${esc(opts.lang === "en" ? p.en : p.bg)}</option>`).join("")}</select></div>` : ""}
-          <div class="bar" style="justify-content:center"><input type="text" class="ph-cap" placeholder="${esc(l.caption)}" style="flex:1;min-width:120px">
+          <div class="bar" style="justify-content:center"><input type="text" class="ph-cap" placeholder="${esc(l.caption)}" value="${esc(st.caption || "")}" style="flex:1;min-width:120px">
             <label class="small" style="border:1px solid var(--line,#d9d5cc);padding:2px 7px;cursor:pointer">${l.add}<input type="file" class="ph-file" accept="image/*" multiple hidden></label>
             <label class="small" style="border:1px solid var(--line,#d9d5cc);padding:2px 7px;cursor:pointer">${l.camera}<input type="file" class="ph-cam" accept="image/*" capture="environment" hidden></label></div>
           ${st.queue.length ? `<div class="ph-q">${st.queue.slice(-6).map((q) => `<div class="${q.bad ? "bad" : "sub"}">${esc(q.name)}: ${esc(q.state)}</div>`).join("")}</div>` : ""}</div>` : ""}
@@ -387,20 +403,22 @@
         <div class="ph-list">${body}</div>
         ${st.open ? box(st.open) : ""}`;
       wire();
-      opts.el.querySelectorAll("img[data-src]").forEach((img) => { const r = st.records.find((x) => x.file_id === img.dataset.src); if (r) urlOf(r).then((u) => { if (!u) return; img.src = u; const a = img.closest(".ph-box") && opts.el.querySelector(".ph-open"); if (a) a.href = u; }).catch(() => {}); });
+      opts.el.querySelectorAll("img[data-src]").forEach((img) => { const r = st.records.find((x) => x.file_id === img.dataset.src); if (r) urlOf(r).then((u) => { if (!u) return; img.src = u; const a = img.closest(".ph-box") && opts.el.querySelector(".ph-open"); if (a) { a.href = u; a.style.opacity = ""; a.style.pointerEvents = ""; } }).catch(() => {}); });
       wireZoom(opts.el.querySelector(".ph-view"));
     }
     function box(r) {
       const l = L();
       return `<div class="ph-box"><div class="ph-view" title="${esc(L().zoom)}"><img alt="" data-src="${esc(r.file_id)}"></div>
-        <div class="ph-meta"><b>${esc(r.labels)}</b>${r.purpose ? ` · ${esc(((opts.purposes || []).find((p) => p.id === r.purpose) || {})[opts.lang === "en" ? "en" : "bg"] || r.purpose)}` : ""}${r.caption ? " – " + esc(r.caption) : ""}<br>${esc(r.taken.replace("T", " ").slice(0, 16))} · ${esc(r.by)} · ${esc(r.size)} · ${r.links ? l.native : l.noNative}</div>
+        <div class="ph-meta"><b>${esc(r.labels)}</b>${r.purpose ? ` · ${esc(((opts.purposes || []).find((p) => p.id === r.purpose) || {})[opts.lang === "en" ? "en" : "bg"] || r.purpose)}` : ""}${r.caption ? " – " + esc(r.caption) : ""}<br>${esc(String(r.taken || "").replace("T", " ").slice(0, 16))} · ${esc(r.by)} · ${esc(r.size)} · ${r.links ? l.native : l.noNative}</div>
         <div class="ph-acts">${st.confirm ? `<span>${l.delAsk}</span><button class="small ph-bad" data-pha="yes">${l.yes}</button><button class="small" data-pha="no">${l.no}</button>`
-          : `${canDelete(r) ? `<button class="small ph-bad" data-pha="del">${l.del}</button>` : ""}<span class="ph-r">${opts.canAdd && (opts.purposes || []).length ? markSelect("ph-markone") : ""}<a class="ph-open" target="_blank" rel="noopener" href="#">${l.openNew}</a><button class="small" data-pha="show">${l.show}</button><button class="small" data-pha="close">${l.close}</button></span>`}</div></div>`;
+          : `${canDelete(r) ? `<button class="small ph-bad" data-pha="del">${l.del}</button>` : ""}<span class="ph-r">${opts.canAdd && (opts.purposes || []).length ? markSelect("ph-markone") : ""}<a class="ph-open" target="_blank" rel="noopener" style="opacity:.5;pointer-events:none">${l.openNew}</a><button class="small" data-pha="show">${l.show}</button><button class="small" data-pha="close">${l.close}</button></span>`}</div></div>`;
     }
     function wire() {
       const el = opts.el, g = (fn) => () => Promise.resolve().then(fn).catch((e) => say(e.message, true));
       const pick = (inp) => { if (inp) inp.onchange = (e) => { const f = [...e.target.files]; e.target.value = ""; g(() => addFiles(f))(); }; };
       pick(el.querySelector(".ph-file")); pick(el.querySelector(".ph-cam"));
+      const cap = el.querySelector(".ph-cap");
+      if (cap) cap.oninput = () => { st.caption = cap.value; };
       const pu = el.querySelector(".ph-purpose");
       if (pu) pu.onchange = () => { st.purpose = pu.value; };
       const drop = el.querySelector(".ph-drop");

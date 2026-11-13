@@ -178,7 +178,7 @@
       project = await api.project.getProject();
       user = await api.user.getUser();
       if (!project || !project.id || !user) throw new Error("no project or user from Trimble Connect");
-      const key = `arsten.access.${project.id}.${user.id || user.email}`;
+      const key = `arsten.access.v2.${project.id}.${user.id || user.email}`;   // v2: with caps; older panel copies use v1 keys
       const st = storage === undefined ? (typeof sessionStorage !== "undefined" ? sessionStorage : null) : storage;
       let res = memo.get(key);
       if (!res && st) { try { const c = JSON.parse(st.getItem(key) || "null"); if (c && Date.now() - c.at < cfg.cacheMinutes * 60000) res = c.res; } catch {} }

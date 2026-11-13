@@ -49,7 +49,10 @@
   const ids = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
   const parseObjects = (s) => { try { const a = JSON.parse(s || "[]"); return Array.isArray(a) ? a : []; } catch { return []; } };
   const isLive = (r) => r.status === "open" || r.status === "rejected";
-  /** The whole record to write (all fields, without the link). Every write sends the full record: pset-api can merge a
+  /** Fields left empty ("") are CLEARED on the server only when the record is written with PsetClient.replace (a PATCH
+   *  drops empty values and keeps the old ones – review 13.11.2026). Writers therefore re-read the record, apply the
+   *  change to that fresh copy and save it with replace().
+   *  The whole record to write (all fields, without the link). Every write sends the full record: pset-api can merge a
    *  PATCH onto a stale copy when two writes come seconds apart, which lost a request's fields live on 13.11.2026. */
   const full = (r, props) => { const o = Object.assign({}, r, props); delete o.link; return o; };
   /** A usable request (old broken records without pour/step are skipped). */
@@ -73,7 +76,7 @@
         for (const o of objs) if (!objects.some((x) => x.guid === o.guid)) objects.push({ modelId: o.modelId, guid: o.guid, label: pour });
         const props = { photos: [...new Set([...ids(cur.photos), ...p.photoIds])].join(","), objects: JSON.stringify(objects) };
         let line = `${stamp(now)} photos +${p.photoIds.length} by ${p.by || "?"}`;
-        if (cur.status === "rejected") { props.status = "open"; props.sent = ""; props.todo_id = ""; line += " – reopened after rejection"; }
+        if (cur.status === "rejected") { Object.assign(props, { status: "open", sent: "", todo_id: "", decided: "", decided_by: "", comment: "" }); line += " – reopened after rejection"; }
         props.log = addLog(cur.log, line);
         writes.push({ link: cur.link, props: full(cur, props), created: false });
       } else {
