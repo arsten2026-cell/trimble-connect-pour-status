@@ -180,6 +180,8 @@
     const fw = (toNum(p[C.P.fwSides]) || 0) + (toNum(p[C.P.fwBottom]) || 0);
     return { volume: toNum(p[C.P.volume]), rebar: toNum(p[C.P.rebar]), formwork: fw || (toNum(p[C.P.fwSides]) == null && toNum(p[C.P.fwBottom]) == null ? null : 0) };
   }
+  // pour name as shown (photos and acceptance requests are filed under it)
+  const accPour = (o) => (o.group && o.group.label) || (o.props && o.props[C.P.number]) || "";
   const pourOf = (o) => (o.group && o.group.numbered ? o.group.key : (o.group && o.group.label) || "");
   const snapOf = (o) => ({ bbox: o.bbox || null, volume: liveQty(o).volume });
 
@@ -224,7 +226,12 @@
       setStatus(`${stepName(step)}: ${done}/${targets.length}…`);
     });
     const verb = mode === "undo" ? L2("отменено", "undone") : mode === "na" ? L2("отбелязано „без“", "marked without") : mode === "note" ? L2("бележка записана", "note saved") : L2("записано", "saved");
-    setStatus(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : ""), failed > 0);
+    let warn = "";
+    if (stepId === "poured" && mode === "mark" && done && window.ArstenAcceptance) {
+      const not = ArstenAcceptance.rebarNotApproved(state.acc || [], targets.map(accPour));
+      if (not.length) warn = " · " + L2(`Внимание: армировката не е приета за ${not.join(", ")}`, `Warning: rebar not accepted for ${not.join(", ")}`);
+    }
+    setStatus(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn, failed > 0 || !!warn);
     render();
     if (state.coloured) await applyColours();
   }
@@ -238,11 +245,63 @@
       el: $("photosBox"), api: state.api, getToken, project: state.project, user: state.user, client: state.client, libId: state.lib.id,
       coreBase: ArstenAccess.coreBase(state.project.location), core: window.ARSTEN_PHOTOS_CORE || undefined,
       canAdd: true, canDeleteAny: !!(state.access && state.access.role === "admin"), lang,
-      targets: () => state.sel.filter((o) => o.guid).map((o) => ({ modelId: o.modelId, id: o.id, guid: o.guid, label: (o.group && o.group.label) || (o.props && o.props[C.P.number]) || "" })),
+      targets: () => state.sel.filter((o) => o.guid).map((o) => ({ modelId: o.modelId, id: o.id, guid: o.guid, label: accPour(o) })),
       onStatus: (text, bad) => setStatus(text, bad),
+      purposes: window.ArstenAcceptance ? [{ id: "formwork", bg: "За приемане – Кофраж", en: "For acceptance – Formwork" }, { id: "rebar", bg: "За приемане – Армировка", en: "For acceptance – Rebar" }] : [],
+      onUploaded: (u) => guarded(() => acceptancePhotos(u)),
     };
     state.photos = opts;
     opts.ui = ArstenPhotos.mount(opts);
+  }
+
+  // ---------- acceptance by the structural designer (shared/arsten-acceptance.js) ----------
+  async function loadAcceptance() {
+    if (!window.ArstenAcceptance || !state.lib) return;
+    try { await state.client.ensureDefinition(state.lib.id, ArstenAcceptance.definition()); } catch (e) { if (e.status !== 403) throw e; }
+    const m = await state.client.listAll(state.lib.id, ArstenAcceptance.DEF_ID, ArstenAcceptance.prefix(state.project.id));
+    state.acc = [...m].map(([link, p]) => Object.assign({ link }, p));
+  }
+  async function acceptancePhotos(u) {
+    const { writes } = ArstenAcceptance.attachPhotos(state.acc || [], { projectId: state.project.id, step: u.purpose, objects: u.objects, photoIds: u.fileIds,
+      by: state.user, newId: () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6) });
+    for (const w of writes) {
+      await state.client.write(state.lib.id, ArstenAcceptance.DEF_ID, w.link, w.props);
+      const cur = (state.acc || []).find((r) => r.link === w.link);
+      if (cur) Object.assign(cur, w.props); else (state.acc = state.acc || []).push(Object.assign({ link: w.link }, w.props));
+    }
+    setStatus(L2(`Заявка за приемане: ${writes.length} (изпратете с „Изпрати за приемане“)`, `Acceptance requests: ${writes.length} (send with "Send for acceptance")`));
+    render();
+  }
+  async function sendAcceptance() {
+    const list = ArstenAcceptance.toSend(state.acc || []);
+    if (!list.length) return;
+    const data = await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
+    const g = (data.groups || []).find((x) => ArstenAccess.groupKey(x.name) === ArstenAccess.groupKey(ArstenAcceptance.APPROVER_GROUP));
+    if (!g) return setStatus(L2("Няма група „4.1-STRUCTURAL DESIGNER“ в проекта.", "No group 4.1-STRUCTURAL DESIGNER in the project."), true);
+    const core = window.ARSTEN_PHOTOS_CORE || ArstenPhotos.coreClient(ArstenAccess.coreBase(state.project.location), getToken);
+    const body = ArstenAcceptance.todoBody(list, { projectId: state.project.id, groupId: g.id, lang });
+    const todo = await core.req("todos", "POST", body);
+    const todoId = (todo && (todo.id || todo.todoId)) || "";
+    for (const r of list) { const props = ArstenAcceptance.markSent(r, todoId, state.user); await state.client.write(state.lib.id, ArstenAcceptance.DEF_ID, r.link, props); Object.assign(r, props); }
+    setStatus(L2(`Изпратено за приемане: ${list.length} (една задача в Connect)`, `Sent for acceptance: ${list.length} (one Connect ToDo)`));
+    render();
+  }
+  function renderAcceptance() {
+    const box = $("accBox");
+    if (!box) return;
+    if (!window.ArstenAcceptance || !state.acc) { box.innerHTML = ""; return; }
+    const A = ArstenAcceptance, pend = A.toSend(state.acc);
+    const pours = [...new Set(state.sel.map(accPour))];
+    const row = (pour, step) => {
+      const r = A.latest(state.acc, pour, step);
+      if (!r) return "";
+      const s = A.STATUS[r.status] || A.STATUS.open;
+      return `<div class="sub"><span class="sw" style="background:${s.colour}"></span>${esc(pour)} · ${esc(A.STEPS[step][lang])}: <b>${esc(s[lang])}</b>${r.status === "open" && !r.sent ? L2(" (неизпратена)", " (not sent)") : ""}${r.decided_by ? ` – ${esc(r.decided_by)} ${esc(r.decided)}` : ""}${r.comment ? `<br>„${esc(r.comment)}“` : ""}</div>`;
+    };
+    box.innerHTML = pours.map((p) => row(p, "formwork") + row(p, "rebar")).join("")
+      + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc">${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
+    const b = $("btnSendAcc");
+    if (b) b.onclick = () => guarded(sendAcceptance);
   }
 
   // ---------- rebar visibility ----------
@@ -455,6 +514,7 @@
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
     $("hPhotos").textContent = L2("Снимки", "Photos");
     if (state.photos) { state.photos.lang = lang; state.photos.ui.render(); }
+    renderAcceptance();
     $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
     $("lblColour").textContent = t("colour");
     $("lblHideRebar").textContent = t("hideRebar"); $("chkHideRebar").checked = !!state.rebarHidden;
@@ -718,6 +778,7 @@
     const inModel = state.objects.filter((o) => state.records.has(o.guid)).length, outside = state.records.size - inModel;
     loadProtection();
     if (state.rebarHidden) { state.rebarIds = null; await setRebarVisible(false); }   // keep "hide rebar" after a model reload
+    try { await loadAcceptance(); } catch (e) { console.error(e); }
     mountPhotos();
     setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}${outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : ""}`);
     render();

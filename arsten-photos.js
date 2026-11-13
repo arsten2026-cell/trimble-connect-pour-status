@@ -30,7 +30,7 @@
       ["file_id", S, "File id / Файл"], ["file_name", S, "File name / Име"], ["day", { type: "string", format: "date" }, "Day / Ден"],
       ["taken", S, "Taken / Заснета"], ["uploaded", S, "Uploaded / Качена"], ["by", S, "By / От"], ["caption", S, "Caption / Описание"],
       ["labels", S, "Pours or marks / Тактове или марки"], ["objects", S, "Objects (JSON) / Обекти"], ["links", S, "Native links / Връзки"],
-      ["size", S, "Size / Размер"], ["deleted", B, "Deleted / Изтрита"]];
+      ["size", S, "Size / Размер"], ["deleted", B, "Deleted / Изтрита"], ["purpose", S, "Purpose / Цел"]];
     const props = {}, labels = {}, order = {};
     fields.forEach(([k, s, l], i) => { props[k] = s; labels[k] = l; order[k] = String(i); });
     return { id: DEF_ID, name: "Site photo / Снимка", description: "Arsten site photos (photos attached to model objects).", schema: { props },
@@ -164,7 +164,8 @@
    * Mount the Photos section.
    * opts: el, api (Workspace API), getToken(refresh), coreBase, project {id}, user (display name), client (PsetClient), libId,
    *       canAdd, canDeleteAny, lang ("bg"|"en"), targets(): [{modelId, id, guid, label}] (current selection),
-   *       onStatus(text, bad)
+   *       onStatus(text, bad), purposes: [{id, bg, en}] (optional upload purposes besides "general"),
+   *       onUploaded({purpose, fileIds, objects}) (optional; after each batch with a purpose)
    */
   function mount(opts) {
     const L = () => T[opts.lang === "en" ? "en" : "bg"];
@@ -240,6 +241,8 @@
       if (!objs.length) return say(L().needSel, true);
       const caption = ((opts.el.querySelector(".ph-cap") || {}).value || "").trim();
       const labels = [...new Set(objs.map((o) => o.label).filter(Boolean))];
+      const purpose = ((opts.el.querySelector(".ph-purpose") || {}).value || "");
+      const uploaded = [];
       const list = [...files].filter((f) => /^image\//.test(f.type) || /\.(jpe?g|png|heic|webp)$/i.test(f.name));
       for (const f of list) st.queue.push({ name: f.name, state: L().up + "…", file: f });
       render();
@@ -256,14 +259,16 @@
           try { links = await nativeLinks(fileId, objs); } catch (e) { linkErr = e.message; }
           const rec = { file_id: fileId, file_name: name, day, taken: isoLocal(img.taken), uploaded: isoLocal(new Date()), by: opts.user || "",
             caption, labels: labels.join(", "), objects: JSON.stringify(objs.map((o) => ({ modelId: o.modelId, guid: o.guid, label: o.label || "" }))),
-            links: links.join(","), size: `${img.w}x${img.h} ${fmtSize(img.size)}`, deleted: false };
+            links: links.join(","), size: `${img.w}x${img.h} ${fmtSize(img.size)}`, deleted: false, purpose };
           const link = photoLink(opts.project.id, fileId);
           await opts.client.write(opts.libId, DEF_ID, link, rec);
           st.records.push(Object.assign({ link }, rec));
+          uploaded.push(fileId);
           q.state = `${L().done}${links.length ? "" : " · " + L().noNative + (linkErr ? ` (${linkErr})` : "")}`;
         } catch (e) { q.state = `${L().fail}: ${e.message}`; q.bad = true; }
         render();
       }
+      if (purpose && uploaded.length && opts.onUploaded) await opts.onUploaded({ purpose, fileIds: uploaded, objects: objs });
     }
 
     async function urlOf(r) {
@@ -316,6 +321,7 @@
       opts.el.innerHTML = `
         ${opts.canAdd ? `<div class="ph-drop">${objs.length ? `<div>${l.to}: <b>${esc(labels.join(", ") || objs.length)}</b> (${objs.length})</div>` : `<div>${l.needSel}</div>`}
           <div>${l.drop}</div>
+          ${(opts.purposes || []).length ? `<div class="bar" style="justify-content:center"><select class="ph-purpose"><option value="">${opts.lang === "en" ? "General" : "Обща"}</option>${opts.purposes.map((p) => `<option value="${esc(p.id)}"${st.purpose === p.id ? " selected" : ""}>${esc(opts.lang === "en" ? p.en : p.bg)}</option>`).join("")}</select></div>` : ""}
           <div class="bar" style="justify-content:center"><input type="text" class="ph-cap" placeholder="${esc(l.caption)}" style="flex:1;min-width:120px">
             <label class="small" style="border:1px solid var(--line,#d9d5cc);padding:2px 7px;cursor:pointer">${l.add}<input type="file" class="ph-file" accept="image/*" multiple hidden></label>
             <label class="small" style="border:1px solid var(--line,#d9d5cc);padding:2px 7px;cursor:pointer">${l.camera}<input type="file" class="ph-cam" accept="image/*" capture="environment" hidden></label></div>
@@ -330,7 +336,7 @@
     function box(r) {
       const l = L();
       return `<div class="ph-box"><img alt="" data-src="${esc(r.file_id)}">
-        <div class="ph-meta"><b>${esc(r.labels)}</b>${r.caption ? " – " + esc(r.caption) : ""}<br>${esc(r.taken.replace("T", " ").slice(0, 16))} · ${esc(r.by)} · ${esc(r.size)} · ${r.links ? l.native : l.noNative}</div>
+        <div class="ph-meta"><b>${esc(r.labels)}</b>${r.purpose ? ` · ${esc(((opts.purposes || []).find((p) => p.id === r.purpose) || {})[opts.lang === "en" ? "en" : "bg"] || r.purpose)}` : ""}${r.caption ? " – " + esc(r.caption) : ""}<br>${esc(r.taken.replace("T", " ").slice(0, 16))} · ${esc(r.by)} · ${esc(r.size)} · ${r.links ? l.native : l.noNative}</div>
         <div class="ph-acts">${st.confirm ? `<span>${l.delAsk}</span><button class="small ph-bad" data-pha="yes">${l.yes}</button><button class="small" data-pha="no">${l.no}</button>`
           : `<button class="small" data-pha="show">${l.show}</button>${canDelete(r) ? `<button class="small ph-bad" data-pha="del">${l.del}</button>` : ""}<button class="small" data-pha="close">${l.close}</button>`}</div></div>`;
     }
@@ -338,6 +344,8 @@
       const el = opts.el, g = (fn) => () => Promise.resolve().then(fn).catch((e) => say(e.message, true));
       const pick = (inp) => { if (inp) inp.onchange = (e) => { const f = [...e.target.files]; e.target.value = ""; g(() => addFiles(f))(); }; };
       pick(el.querySelector(".ph-file")); pick(el.querySelector(".ph-cam"));
+      const pu = el.querySelector(".ph-purpose");
+      if (pu) pu.onchange = () => { st.purpose = pu.value; };
       const drop = el.querySelector(".ph-drop");
       if (drop) {
         drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("on"); };
