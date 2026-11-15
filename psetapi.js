@@ -139,6 +139,25 @@
       return this.request("pset", psetPath(link, libId, defId), "PATCH", { props: clean(props) });
     }
 
+    /** One pset with its version: {props, v}; props is null when the pset was deleted (v still returned, so a new
+     *  write can go on top of it); null when it never existed. */
+    async readOne(libId, defId, link) {
+      const path = psetPath(link, libId, defId);
+      let p = null;
+      try { p = await this.request("pset", path); } catch (e) { if (e.status !== 404) throw e; }
+      if (p && !p.deleted) return { props: p.props || {}, v: p.v };
+      try { const d = await this.request("pset", path + "?deleted"); if (d) return { props: null, v: d.v }; } catch (e) { if (e.status !== 404) throw e; }
+      return p ? { props: null, v: p.v } : null;
+    }
+
+    /** Merge-write (PATCH) carrying the version read with readOne, so a write made by someone else in between
+     *  is refused (412/409) instead of overwritten. v undefined: plain create / merge. */
+    writeIfUnchanged(libId, defId, link, props, v) {
+      const body = { props: clean(props) };
+      if (v !== undefined && v !== null) body.v = v;
+      return this.request("pset", psetPath(link, libId, defId), "PATCH", body);
+    }
+
     /** Replace the whole status of one object, so fields can be cleared (pset-api rejects "" and null for typed
      *  fields, and PATCH cannot remove a field). Same as Connect web: delete, then re-create; if the deleted pset
      *  still blocks (412), re-create on top of its version. */
