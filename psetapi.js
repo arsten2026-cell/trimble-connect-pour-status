@@ -67,16 +67,17 @@
       const want = (Array.isArray(names) ? names : [names]).map(norm);
       const ids = await this.projectLibraryIds(projectId);
       const others = [], hits = [];
+      let denied = 0;   // libraries of the project this user may not read: "no access", never "missing" (week 1, F9)
       for (const id of ids) {
         try {
           const lib = await this.getLibrary(id);
           const rank = lib ? want.indexOf(norm(lib.name)) : -1;
           if (rank >= 0) hits.push({ rank, lib });
           else if (lib) others.push(lib.name);
-        } catch (e) { if (e.status !== 403 && e.status !== 404) throw e; }
+        } catch (e) { if (e.status === 403) denied++; else if (e.status !== 404) throw e; }
       }
       hits.sort((a, b) => a.rank - b.rank);
-      return { lib: hits.length ? hits[0].lib : null, others };
+      return { lib: hits.length ? hits[0].lib : null, others, denied };
     }
 
     /** Make sure the status definition exists in the library and has all fields (creates or extends it). */
@@ -156,6 +157,11 @@
       const body = { props: clean(props) };
       if (v !== undefined && v !== null) body.v = v;
       return this.request("pset", psetPath(link, libId, defId), "PATCH", body);
+    }
+
+    /** Delete one pset; no error when it does not exist (404) or is already deleted (410). */
+    async remove(libId, defId, link) {
+      try { await this.request("pset", psetPath(link, libId, defId), "DELETE"); } catch (e) { if (e.status !== 404 && e.status !== 410) throw e; }
     }
 
     /** Replace the whole status of one object, so fields can be cleared (pset-api rejects "" and null for typed

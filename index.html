@@ -51,6 +51,33 @@
   .hrow { display:flex; align-items:center; justify-content:space-between; gap:8px; }
   .hrow h2 { margin-bottom:6px; }
   .empty { color:var(--muted); font-size:12px; padding:8px 0; }
+  .step .hint { font-size:11px; color:var(--muted); min-height:0; }
+  .step .hint:empty { display:none; }
+  .confirm { border:1px solid var(--accent); background:#fff; padding:6px; margin-top:4px; font-size:12px; }
+  .confirm .bar { margin:4px 0 0; }
+  /* result of a write, at the bottom near the finger (A2) */
+  body { padding-bottom:calc(56px + env(safe-area-inset-bottom, 0px)); }
+  /* always in the DOM (screen readers), visually hidden when idle; taps pass through, and it stays left of the
+     right-aligned "Отмени" so it never blocks the undo row */
+  .toast { position:fixed; left:8px; bottom:calc(8px + env(safe-area-inset-bottom, 0px)); z-index:50; max-width:min(70%, 420px);
+    padding:8px 10px; font-size:13px; color:#fff; pointer-events:none; }
+  .toast:not(.show) { width:1px; height:1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap; }
+  .toast.ok { background:var(--ok); }
+  .toast.bad { background:var(--bad); }
+  /* touch screens (A1): ~40 px targets, 16 px inputs (no iOS zoom), destructive buttons away from the main action */
+  @media (pointer: coarse) {
+    button, button.small, select, input[type=date], input[type=text] { min-height:40px; }
+    button.small { padding:6px 12px; font-size:14px; }
+    select, input[type=date], input[type=text] { font-size:16px; padding:6px 8px; }
+    input[type=checkbox] { width:22px; height:22px; }
+    label.chk { min-height:40px; font-size:14px; }
+    .bar { gap:8px; }
+    .step .row { gap:8px; flex-wrap:wrap; }
+    .step .row input[type=date] { width:auto; flex:1 1 150px; }
+    .step .row input[type=text] { flex:1 1 160px; width:auto; }
+    .step .row button.undo { margin-left:auto; }
+    .confirm .bar button.cancel { margin-left:auto; }
+  }
 </style>
 </head>
 <body>
@@ -115,13 +142,15 @@
   </div>
 </div>
 
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
 <script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js" integrity="sha384-lFiNt/56q6HnUNbuy0WHO3NP6BkQjY4EH8+5eELYVfnhkB42snRTmSa3UOAlX9gg" crossorigin="anonymous"></script>
-<script src="arsten-access.js?v=7"></script>
+<script src="arsten-access.js?v=8"></script>
 <script src="common.js?v=1"></script>
 <script src="status.js?v=16"></script>
-<script src="psetapi.js?v=6"></script>
+<script src="psetapi.js?v=7"></script>
 <script src="arsten-photos.js?v=8"></script>
 <script src="arsten-acceptance.js?v=5"></script>
-<script src="app.js?v=33"></script>
+<script src="app.js?v=35"></script>
 </body>
 </html>

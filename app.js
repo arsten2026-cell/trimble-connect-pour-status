@@ -2,9 +2,43 @@
 // status record (4 steps with date, by, note, history) stored in Trimble Connect's Property Set service on the link
 // frn:entity:{IFC GUID}, in the project library "CIP/Монолитно", so it also shows in Connect's property panel
 // and survives new IFC versions as long as Tekla keeps the pour object GUIDs.
+
+// Pure helpers for the panel (no DOM), exported for node tests (test/ui.test.js).
+(function (g) {
+  "use strict";
+  const ymd = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || "")); return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : null; };
+  /** Whole days from date (YYYY-MM-DD) back to today (YYYY-MM-DD); negative = future; null if not a date. */
+  function daysBack(date, today) {
+    const a = ymd(date), b = ymd(today);
+    return a == null || b == null ? null : Math.round((b - a) / 86400000);
+  }
+  /** Grey hint under a date box (week 1, A6): only when the date is more than 7 days back, or in the future. */
+  function dateHint(date, today, lang) {
+    const d = daysBack(date, today);
+    if (d == null) return "";
+    const bg = lang !== "en";
+    if (d < 0) return bg ? "датата е в бъдещето" : "the date is in the future";
+    if (d > 7) return bg ? `преди ${d} дни – проверете датата` : `${d} days ago – check the date`;
+    return "";
+  }
+  /** Value shown in a step box: what the user typed (draft) wins over the saved/prefilled value (week 1, F6). */
+  const boxValue = (saved, draft) => (draft != null ? draft : saved);
+  /** Drafts typed for selection `draftGuids` stay only when the new selection still contains all of it ("one more
+   *  piece" picked); any other selection drops them, so a note typed for pour A is never written to pour B (M2). */
+  function keepDrafts(draftGuids, selGuids) {
+    const d = [...(draftGuids || [])];
+    if (!d.length) return false;
+    const s = new Set(selGuids || []);
+    return d.every((g) => s.has(g));
+  }
+  const U = { daysBack, dateHint, boxValue, keepDrafts };
+  if (typeof module === "object" && module.exports) module.exports = U; else g.PourUi = U;
+})(typeof window !== "undefined" ? window : globalThis);
+
 (() => {
   "use strict";
-  const C = window.PourLogic, S = window.PourStatus, A = window.PsetApi;
+  if (typeof document === "undefined") return;
+  const C = window.PourLogic, S = window.PourStatus, A = window.PsetApi, U = window.PourUi;
   const $ = (id) => document.getElementById(id);
   const PROXY = "IfcBuildingElementProxy";
   const BATCH = 200;
@@ -37,12 +71,32 @@
     sel: [],                                 // selected pour objects
     coloured: false,
     seeThrough: (() => { try { return localStorage.getItem("arsten.pourStatus.seeThrough") !== "0"; } catch { return true; } })(),   // not started = see-through (default on)
+    drafts: {},                              // stepId -> {date?, note?} typed but not saved yet (survives re-renders; week 1, F6)
+    draftSel: [],                            // GUIDs of the selection the drafts were typed for (M2)
+    confirmOrphan: null,                     // guid of the orphan whose inline "Прехвърли" confirm box is open (week 1, F7)
   };
   const objKey = (o) => o.modelId + ":" + o.id;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   function setStatus(text, bad) { $("status").textContent = text; $("status").className = "status" + (bad ? " bad" : ""); }
+  // Result of a write, shown at the bottom of the panel near the finger (week 1, A2); the status line stays as well.
+  // The element stays in the DOM (visually hidden when idle) so screen readers announce it; errors use role="alert".
+  let toastTimer = null;
+  function toast(text, bad) {
+    const el = $("toast");
+    if (!el || !text) return;
+    el.setAttribute("role", bad ? "alert" : "status");
+    el.textContent = text;
+    el.className = "toast show " + (bad ? "bad" : "ok");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.className = "toast"; el.textContent = ""; }, bad ? 8000 : 4000);
+  }
+  // Writes in flight: a model reload waits for them, so a reload's older read can't replace a fresh write (M4).
+  let inflight = 0;
+  async function writing(fn) { inflight++; try { return await fn(); } finally { inflight--; } }
+  const reloadBusy = () => reloading || reloadTimer != null;
+  function report(text, bad) { setStatus(text, bad); toast(text, bad); }
   const errText = (e) => (e && (e.message || e.toString())) || String(e);
-  async function guarded(fn) { try { await fn(); } catch (e) { setStatus("Error: " + errText(e), true); console.error(e); } }
+  async function guarded(fn) { try { await fn(); } catch (e) { const m = L2("Грешка: ", "Error: ") + errText(e); setStatus(m, true); toast(m, true); console.error(e); } }
   async function pool(items, n, fn) {
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (next < items.length) { const k = next++; await fn(items[k], k); } }));
@@ -100,6 +154,14 @@
   async function setup() {
     $("setupBox").hidden = true;
     const found = await state.client.findLibrary(state.project.id, S.LIB_NAMES);
+    if (!found.lib && found.denied > 0) {
+      // A library the user may not read exists: it may be ours, so never ask for a new one (a second CIP/Монолитно; F9).
+      showSetup(`<b>${esc(L2("Библиотеката съществува, но нямате достъп до нея – обърнете се към администратора.",
+        "The library exists, but you have no access to it – ask the project administrator."))}</b>
+        <div class="sub">${esc(L2(`Библиотека: ${S.LIB_NAME}`, `Library: ${S.LIB_NAME}`))}</div>
+        <button id="btnRecheck" class="small">${L2("Провери отново", "Check again")}</button>`);
+      return false;
+    }
     if (!found.lib) {
       showSetup(`<b>${lang === "bg" ? "Нужна е еднократна настройка от администратор на проекта." : "One-time setup by a project admin is needed."}</b>
         <ol><li>${lang === "bg" ? "Отворете" : "Open"} <b>Property Set Libraries</b> ${lang === "bg" ? "в менюто на проекта" : "in the project menu"}.</li>
@@ -155,17 +217,25 @@
     let n = 0;
     for (const m of sel) for (const id of m.objectRuntimeIds || []) { n++; const o = state.byKey.get(m.modelId + ":" + id); if (o) picked.push(o); }
     if (!n) {
-      if (quiet === true) { state.sel = []; setStatus(""); return render(); }
+      // A model reload empties the viewer selection: keep the panel's selection and drafts, the reload restores them (M3 d).
+      if (quiet === true && reloadBusy()) return;
+      if (quiet === true) { setSel([]); setStatus(""); return render(); }
       return setStatus(t("nothing"), true);
     }
     if (!picked.length) return setStatus(`${n} ${lang === "bg" ? "избрани обекта, но нито един не е такт." : "objects selected, none of them is a pour object."}`, true);
-    state.sel = picked;
+    setSel(picked);
     setStatus("");
     render();
   }
+  /** Every selection change goes through here: drafts stay only for a superset of the selection they were typed for (M2). */
+  function setSel(objs) {
+    state.sel = objs.slice();
+    if (reloadTimer != null && !reloading) pendingKeep = state.sel.map((o) => o.guid);   // a reload is waiting: restore this one
+    if (Object.keys(state.drafts).length && !U.keepDrafts(state.draftSel, state.sel.map((o) => o.guid))) { state.drafts = {}; state.draftSel = []; }
+  }
   async function selectPour(g) { await selectObjects(g.objects); }
   async function selectObjects(objs) {
-    state.sel = objs.slice();
+    setSel(objs);
     const byModel = new Map();
     for (const o of objs) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
     const sel = { modelObjectIds: [...byModel].map(([modelId, objectRuntimeIds]) => ({ modelId, objectRuntimeIds })) };
@@ -195,12 +265,16 @@
     const note = noteBox.value.trim();
     const objs = state.sel.slice();
     if (!objs.length) return;
-    const has = (o) => (state.records.get(o.guid) || {})[stepId];
+    // max = today on the box, but a typed date can still pass it (A6)
+    if (!keepDate && (mode === "mark" || mode === "na") && (U.daysBack(dateBox.value, S.today()) || 0) < 0) {
+      return report(L2("Датата е в бъдещето – изберете днешна или по-ранна дата.", "The date is in the future – pick today or an earlier date."), true);
+    }
+    const has =(o) => (state.records.get(o.guid) || {})[stepId];
     // Partly done selection: "Готово" marks only the objects that do not have the step yet (the others keep theirs).
     const partly = objs.some(has) && !objs.every(has);
     const targets = mode === "mark" || mode === "na" ? (partly ? objs.filter((o) => !has(o)) : objs) : objs.filter(has);
-    if (!targets.length) return setStatus(lang === "bg" ? "Няма обекти с този етап." : "No objects with this step.");
-    if (mode === "note" && keepNote) return setStatus(lang === "bg" ? "Напишете бележка." : "Type a note.");
+    if (!targets.length) return report(lang === "bg" ? "Няма обекти с този етап." : "No objects with this step.", true);
+    if (mode === "note" && keepNote) return report(lang === "bg" ? "Напишете бележка." : "Type a note.", true);
     let done = 0, failed = 0, firstErr = "";
     setStatus(`${stepName(step)}: 0/${targets.length}…`);
     await pool(targets, 6, async (o) => {
@@ -231,7 +305,8 @@
       const not = ArstenAcceptance.rebarNotApproved(state.acc || [], targets.map(accPour));
       if (not.length) warn = " · " + L2(`Внимание: армировката не е приета за ${not.join(", ")}`, `Warning: rebar not accepted for ${not.join(", ")}`);
     }
-    setStatus(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn, failed > 0 || !!warn);
+    if (done && !failed) delete state.drafts[stepId];   // saved: the boxes show the saved values again
+    report(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn, failed > 0 || !!warn);
     render();
     if (state.coloured) await applyColours();
   }
@@ -241,14 +316,39 @@
   // so everyone here may add photos; admins may delete anyone's, the others their own.
   function mountPhotos() {
     if (state.photos || !window.ArstenPhotos || !state.lib) return;
+    // The photo module saves each photo record with client.write; wrap it to report the result near the finger (A2).
+    // A new photo's record has no purpose-only change: re-marking existing photos (only `purpose` changes, uploaded long
+    // ago) gets no toast of its own (the acceptance request reports it). Several uploads give one toast with the count.
+    const client = Object.create(state.client);
+    let upN = 0, upTimer = null;
+    client.write = (...a) => writing(async () => {
+      let r;
+      try { r = await state.client.write.apply(state.client, a); }
+      catch (e) { toast(L2("Снимката не е записана: ", "Photo not saved: ") + errText(e), true); throw e; }
+      const rec = a[3] || {};
+      if (rec.deleted) toast(L2("Снимката е изтрита", "Photo deleted"));
+      else if (Date.now() - (Date.parse(rec.uploaded || "") || 0) < 120000) {
+        upN++;
+        clearTimeout(upTimer);
+        upTimer = setTimeout(() => { upN = 0; }, 5000);
+        toast(upN > 1 ? L2(`Качени снимки: ${upN} ✓`, `Photos uploaded: ${upN} ✓`) : L2("Снимката е качена ✓", "Photo uploaded ✓"));
+      }
+      return r;
+    });
+    // Upload steps that fail (start / commit of the file) show a red toast; the photo module marks the row "грешка".
+    const baseCore = window.ARSTEN_PHOTOS_CORE || ArstenPhotos.coreClient(ArstenAccess.coreBase(state.project.location), getToken);
+    const core = { req: async (path, ...rest) => {
+      try { return await baseCore.req(path, ...rest); }
+      catch (e) { if (/^files\/fs\/(initiate|commit)$/.test(path)) toast(L2("Снимката не е качена: ", "Photo upload failed: ") + errText(e), true); throw e; }
+    } };
     const opts = {
-      el: $("photosBox"), api: state.api, getToken, project: state.project, user: state.user, client: state.client, libId: state.lib.id,
-      coreBase: ArstenAccess.coreBase(state.project.location), core: window.ARSTEN_PHOTOS_CORE || undefined,
+      el: $("photosBox"), api: state.api, getToken, project: state.project, user: state.user, client, libId: state.lib.id,
+      coreBase: ArstenAccess.coreBase(state.project.location), core,
       canAdd: true, canDeleteAny: !!(state.access && state.access.role === "admin"), lang,
       targets: () => state.sel.filter((o) => o.guid).map((o) => ({ modelId: o.modelId, id: o.id, guid: o.guid, label: accPour(o) })),
-      onStatus: (text, bad) => setStatus(text, bad),
+      onStatus: (text, bad) => { setStatus(text, bad); if (bad) toast(text, true); },
       purposes: window.ArstenAcceptance ? [{ id: "formwork", bg: "За приемане – Кофраж", en: "For acceptance – Formwork" }, { id: "rebar", bg: "За приемане – Армировка", en: "For acceptance – Rebar" }, { id: "both", bg: "За приемане – Кофраж и армировка", en: "For acceptance – Formwork and rebar" }] : [],
-      onUploaded: (u) => guarded(() => acceptancePhotos(u)),
+      onUploaded: (u) => guarded(() => writing(() => acceptancePhotos(u))),
     };
     state.photos = opts;
     opts.ui = ArstenPhotos.mount(opts);
@@ -289,7 +389,7 @@
     const { writes } = ArstenAcceptance.attachPhotos(state.acc || [], { projectId: state.project.id, step: u.purpose, objects: u.objects, photoIds: u.fileIds,
       by: state.user, newId: () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6) });
     for (const w of writes) await saveAcc(w.link, () => w.props);
-    setStatus(L2(`Заявка за приемане: ${writes.length} (изпратете с „Изпрати за приемане“)`, `Acceptance requests: ${writes.length} (send with "Send for acceptance")`));
+    report(L2(`Заявка за приемане: ${writes.length} (изпратете с „Изпрати за приемане“)`, `Acceptance requests: ${writes.length} (send with "Send for acceptance")`));
     render();
   }
   async function sendAcceptance() {
@@ -300,16 +400,16 @@
   async function sendAcceptanceNow() {
     await loadAcceptance();   // fresh: someone may have decided or sent meanwhile
     const list = ArstenAcceptance.toSend(state.acc || []);
-    if (!list.length) { render(); return setStatus(L2("Няма неизпратени заявки.", "Nothing left to send.")); }
+    if (!list.length) { render(); return report(L2("Няма неизпратени заявки.", "Nothing left to send.")); }
     const data = await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
     const g = (data.groups || []).find((x) => ArstenAccess.groupKey(x.name) === ArstenAccess.groupKey(ArstenAcceptance.APPROVER_GROUP));
-    if (!g) return setStatus(L2("Няма група „4.1-STRUCTURAL DESIGNER“ в проекта.", "No group 4.1-STRUCTURAL DESIGNER in the project."), true);
+    if (!g) return report(L2("Няма група „4.1-STRUCTURAL DESIGNER“ в проекта.", "No group 4.1-STRUCTURAL DESIGNER in the project."), true);
     const core = window.ARSTEN_PHOTOS_CORE || ArstenPhotos.coreClient(ArstenAccess.coreBase(state.project.location), getToken);
     const body = ArstenAcceptance.todoBody(list, { projectId: state.project.id, groupId: g.id, lang });
     const todo = await core.req("todos", "POST", body);
     const todoId = (todo && (todo.id || todo.todoId)) || "";
     for (const r of list) await saveAcc(r.link, (fresh) => (fresh && fresh.status === "open" && !fresh.sent ? ArstenAcceptance.markSent(fresh, todoId, state.user) : null));
-    setStatus(L2(`Изпратено за приемане: ${list.length} (една задача в Connect)`, `Sent for acceptance: ${list.length} (one Connect ToDo)`));
+    report(L2(`Изпратено за приемане: ${list.length} (една задача в Connect)`, `Sent for acceptance: ${list.length} (one Connect ToDo)`));
     render();
   }
   function renderAcceptance() {
@@ -328,7 +428,7 @@
     box.innerHTML = pours.map((p) => row(p, "formwork") + row(p, "rebar") + row(p, "both")).join("")
       + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc"${accBusy ? " disabled" : ""}>${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
     const b = $("btnSendAcc");
-    if (b) b.onclick = () => guarded(sendAcceptance);
+    if (b) b.onclick = () => guarded(() => writing(sendAcceptance));
   }
 
   // ---------- rebar visibility ----------
@@ -558,6 +658,10 @@
     }
     // steps
     const guids = sel.map((o) => o.guid);
+    const today = S.today();
+    const act = document.activeElement;
+    const focus = act && /^(date|note)_/.test(act.id || "") && $("steps").contains(act)
+      ? { id: act.id, start: act.type === "text" ? act.selectionStart : null, end: act.type === "text" ? act.selectionEnd : null } : null;
     $("steps").innerHTML = S.STEPS.map((s, i) => {
       const st = S.stepState(state.records, guids, s.id);
       const v = S.stepValues(state.records, guids, s.id);
@@ -569,15 +673,24 @@
       const dateVal = partly ? S.today() : v.mixedDate ? "" : v.date || S.today();
       if (partly) { v.mixedNote = false; v.note = ""; }
       const notePh = v.mixedNote ?L2("различни бележки – празно = без промяна", "different notes – empty = keep") : t("note");
+      // typed but not saved yet wins over the prefill (F6)
+      const dr = state.drafts[s.id] || {};
+      const dateShown = U.boxValue(dateVal, dr.date), noteShown = U.boxValue(v.note || "", dr.note);
       return `<div class="step" style="--c:${s.colour}">
         <div class="hd"><span class="nm">${i + 1}. ${esc(stepName(s))}</span><span class="st ${st.state}">${label}</span></div>
         ${st.dates.length ? `<div class="dates">${esc(st.dates.join(", "))}</div>` : ""}
-        <div class="row"><input type="date" id="date_${s.id}" value="${esc(dateVal)}" title="${v.mixedDate ? esc(L2("различни дати – празно = без промяна", "different dates – empty = keep")) : ""}"><input type="text" id="note_${s.id}" data-mixed="${v.mixedNote ? 1 : 0}" value="${esc(v.note || "")}" placeholder="${esc(notePh)}"></div>
+        <div class="row"><input type="date" id="date_${s.id}" max="${today}" value="${esc(dateShown)}" title="${v.mixedDate ? esc(L2("различни дати – празно = без промяна", "different dates – empty = keep")) : ""}"><input type="text" id="note_${s.id}" data-mixed="${v.mixedNote ? 1 : 0}" value="${esc(noteShown)}" placeholder="${esc(notePh)}"></div>
+        <div class="hint" id="hint_${s.id}">${dr.date != null ? esc(U.dateHint(dr.date, today, lang)) : ""}</div>
         <div class="row"><button class="small" data-act="mark" data-step="${s.id}" ${sel.length ? "" : "disabled"}>${esc(partly ? `${t("markDone")} (${st.total - st.done})` : st.done ? t("save") : t("markDone"))}</button><button
           class="small secondary" data-act="na" data-step="${s.id}" ${sel.length ? "" : "disabled"} title="${esc(t("withoutTip"))}" ${s.na ? "" : "hidden"}>${esc(t("without"))}</button><button
           class="small secondary" data-act="note" data-step="${s.id}" ${st.done ? "" : "disabled"} title="${esc(t("noteOnlyTip"))}">${esc(t("noteOnly"))}</button><button
-          class="small secondary" data-act="undo" data-step="${s.id}" ${st.done ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
+          class="small secondary undo" data-act="undo" data-step="${s.id}" ${st.done ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
     }).join("");
+    if (focus && $(focus.id)) {   // the re-render replaced the box the user was typing in: keep the cursor there
+      const el = $(focus.id);
+      el.focus();
+      try { if (focus.start != null) el.setSelectionRange(focus.start, focus.end); } catch {}
+    }
     // legend
     $("legend").innerHTML = STAGES.map((s, k) => `<span><span class="sw" style="background:${s.colour}${k === 0 && state.seeThrough ? `;opacity:${NOT_STARTED_OPACITY + 0.25}` : ""}"></span>${esc(stepName(s))}${k === 0 && state.seeThrough ? ` <span class="sub">(${lang === "bg" ? "прозрачно" : "see-through"})</span>` : ""}</span>`).join("");
     // summary
@@ -636,9 +749,13 @@
       $("orphanText").textContent = lang === "bg"
         ? `${orph.length} записа със статус сочат към обекти, които вече ги няма в модела (вероятно Tekla е пресъздала такта). Свържете ги ръчно към новия обект.`
         : `${orph.length} status records point to objects that are no longer in the model (Tekla probably rebuilt the pour). Re-attach them to the new object.`;
+      // "Прехвърли" opens an inline Запиши / Откажи box (no window.confirm: Connect's frame can block it; F7)
       $("orphanRows").innerHTML = orph.map((x, i) => `<tr><td><span class="name">${esc(x.record.pour || "?")}</span>
-          <div class="sub">${esc(x.record.stage || "")} · ${esc(x.guid)}</div></td>
-        <td>${x.candidates.length ? `<button class="small" data-act="reattach" data-i="${i}" title="${esc(x.candidates.map((c) => c.guid).join(", "))}">${lang === "bg" ? "Прехвърли" : "Re-attach"} → ${x.candidates.length} ${x.exact ? "" : "?"}</button>` : `<span class="sub">${lang === "bg" ? "няма съвпадение" : "no match"}</span>`}</td></tr>`).join("");
+          <div class="sub">${esc(x.record.stage || "")} · ${esc(x.guid)}</div>
+          ${state.confirmOrphan === x.guid ? `<div class="confirm" role="group"><div>${esc(L2(`Да се копира статусът (${x.record.stage}) към ${x.candidates.length} обект(а) от ${x.record.pour}?`,
+            `Copy the status (${x.record.stage}) to ${x.candidates.length} object(s) of ${x.record.pour}?`))}</div>
+            <div class="bar"><button class="small" data-act="reattachYes" data-i="${i}"${state.reattachBusy ? " disabled" : ""}>${L2("Запиши", "Save")}</button><button class="small secondary cancel" data-act="reattachNo" data-i="${i}"${state.reattachBusy ? " disabled" : ""}>${L2("Откажи", "Cancel")}</button></div></div>` : ""}</td>
+        <td>${x.candidates.length ? `<button class="small" data-act="reattach" data-i="${i}" ${state.confirmOrphan === x.guid ? "disabled" : ""} title="${esc(x.candidates.map((c) => c.guid).join(", "))}">${lang === "bg" ? "Прехвърли" : "Re-attach"} → ${x.candidates.length} ${x.exact ? "" : "?"}</button>` : `<span class="sub">${lang === "bg" ? "няма съвпадение" : "no match"}</span>`}</td></tr>`).join("");
       state.orphans = orph;
     }
   }
@@ -651,7 +768,7 @@
   };
   async function splitApply(i) {
     const x = state.splits[i], pieces = splitPieces(i);
-    if (!pieces.length) return setStatus(L2("Не са избрани части.", "No pieces ticked."));
+    if (!pieces.length) return report(L2("Не са избрани части.", "No pieces ticked."), true);
     let done = 0;
     await pool(pieces, 6, async (pc) => {
       const props = S.inherit(x.record, x.guid, { by: state.user, pour: pc.pour, key: pc.key, snap: snapOf(pc.obj) });
@@ -659,7 +776,7 @@
       state.records.set(pc.guid, props); done++;
     });
     await splitClose(x, done);
-    setStatus(`${x.record.pour}: ${L2("статусът е прехвърлен на", "status passed on to")} ${done} ${L2("нови части", "new pieces")}`);
+    report(`${x.record.pour}: ${L2("статусът е прехвърлен на", "status passed on to")} ${done} ${L2("нови части", "new pieces")}`);
     render();
     if (state.coloured) await applyColours();
   }
@@ -670,7 +787,9 @@
     state.records.set(x.guid, next);
   }
   async function splitSkip(i) {
-    await splitClose(state.splits[i], 0);
+    const x = state.splits[i];
+    await splitClose(x, 0);
+    report(`${x.record.pour || ""}: ${L2("отбелязано – без прехвърляне", "marked – nothing passed on")}`);
     render();
   }
   async function splitShow(i) {
@@ -692,7 +811,7 @@
       await state.client.write(state.lib.id, state.defId, S.entityLink(g.guid), r);
       state.records.set(g.guid, r);
     }
-    setStatus(`${o ? pourOf(o) : ""}: ${L2("обединяването е записано", "merge saved")}`);
+    report(`${o ? pourOf(o) : ""}: ${L2("обединяването е записано", "merge saved")}`);
     render();
   }
   async function mergeShow(i) {
@@ -732,18 +851,23 @@
   }
 
   // Re-attach an orphaned status: copy it to the candidate object(s) (the old record stays, for history).
+  // Called from the inline confirm box (reattachYes).
+  // The box stays open with its buttons disabled until the writes are done, so it can't be saved twice (Low 4).
   async function reattach(x) {
-    const ok = window.confirm(lang === "bg"
-      ? `Да се копира статусът (${x.record.stage}) към ${x.candidates.length} обект(а) от ${x.record.pour}?`
-      : `Copy the status (${x.record.stage}) to ${x.candidates.length} object(s) of ${x.record.pour}?`);
-    if (!ok) return;
-    for (const c of x.candidates) {
-      const props = Object.assign({}, x.record, { key: c.key });
-      props.log = (props.log ? props.log + "\n" : "") + `${S.today()} re-attached from ${x.guid} by ${state.user}`;
-      await state.client.write(state.lib.id, state.defId, S.entityLink(c.guid), props);
-      state.records.set(c.guid, props);
-    }
+    if (!x || state.reattachBusy) { if (!x) { state.confirmOrphan = null; render(); } return; }
+    state.reattachBusy = true;
     render();
+    try {
+      for (const c of x.candidates) {
+        const props = Object.assign({}, x.record, { key: c.key });
+        props.log = (props.log ? props.log + "\n" : "") + `${S.today()} re-attached from ${x.guid} by ${state.user}`;
+        await state.client.write(state.lib.id, state.defId, S.entityLink(c.guid), props);
+        state.records.set(c.guid, props);
+      }
+    } finally { state.reattachBusy = false; state.confirmOrphan = null; }
+    report(`${x.record.pour || ""}: ${L2("статусът е прехвърлен на", "status re-attached to")} ${x.candidates.length} ${L2("обекта", "objects")}`);
+    render();
+    if (state.coloured) await applyColours();
   }
 
   // ---------- wiring ----------
@@ -751,16 +875,24 @@
     const b = e.target.closest("button[data-act]");
     if (!b) return;
     const act = b.dataset.act;
-    guarded(async () => {
+    const WRITES = ["mark", "undo", "note", "na", "reattachYes", "splitApply", "splitSkip", "mergeApply"];
+    if (WRITES.includes(act) && reloading) return report(L2("Моделът се презарежда – опитайте след малко.", "The model is reloading – try again in a moment."), true);
+    guarded(() => writing(async () => {
       if (act === "mark" || act === "undo" || act === "note" || act === "na") await applyStep(b.dataset.step, act);
       else if (act === "pickPour") await selectPour(state.pours[+b.dataset.i]);
-      else if (act === "reattach") await reattach(state.orphans[+b.dataset.i]);
+      else if (act === "reattach") { state.confirmOrphan = state.orphans[+b.dataset.i].guid; render(); }
+      else if (act === "reattachNo") { state.confirmOrphan = null; render(); }
+      else if (act === "reattachYes") {
+        const x = state.orphans[+b.dataset.i];
+        b.disabled = true;
+        await reattach(x && x.guid === state.confirmOrphan ? x : null);
+      }
       else if (act === "splitApply") await splitApply(+b.dataset.i);
       else if (act === "splitSkip") await splitSkip(+b.dataset.i);
       else if (act === "splitShow") await splitShow(+b.dataset.i);
       else if (act === "mergeApply") await mergeApply(+b.dataset.i);
       else if (act === "mergeShow") await mergeShow(+b.dataset.i);
-    });
+    }));
   });
   $("btnFromViewer").onclick = () => guarded(selectionFromViewer);
   $("btnCsv").onclick = () => guarded(exportExcel);
@@ -775,10 +907,24 @@
   let followTimer = null;
   function onViewerSelection() {
     if (!state.follow || !state.ready || !state.api) return;
+    if (reloading) {   // objects are being re-read: note only that the user picked something (an empty selection is the reload's own)
+      state.api.viewer.getSelection().then((sel) => { if ((sel || []).some((m) => (m.objectRuntimeIds || []).length)) selDuringReload = true; }).catch(() => {});
+      return;
+    }
     clearTimeout(followTimer);
     followTimer = setTimeout(() => guarded(() => selectionFromViewer(true)), 200);
   }
-  $("btnSelClear").onclick = () => { state.sel = []; render(); };
+  $("btnSelClear").onclick = () => { setSel([]); state.drafts = {}; state.draftSel = []; render(); };
+  // Keep what the user types in the step cards (re-renders on every selection change would wipe it; F6) and refresh the
+  // date hint (A6). Delegated, because the cards are re-rendered.
+  $("steps").addEventListener("input", (e) => {
+    const m = /^(date|note)_(\w+)$/.exec(e.target.id || "");
+    if (!m) return;
+    if (!Object.keys(state.drafts).length) state.draftSel = state.sel.map((o) => o.guid);   // drafts belong to this selection
+    const d = state.drafts[m[2]] || (state.drafts[m[2]] = {});
+    d[m[1]] = e.target.value;
+    if (m[1] === "date") { const h = $("hint_" + m[2]); if (h) h.textContent = U.dateHint(e.target.value, S.today(), lang); }
+  });
   $("chkSeeThrough").onchange = (e) => guarded(async () => {
     state.seeThrough = e.target.checked;
     try { localStorage.setItem("arsten.pourStatus.seeThrough", state.seeThrough ? "1" : "0"); } catch {}
@@ -827,7 +973,44 @@
     if (event === "extension.accessToken") onToken(data);
     if (state.denied) return;
     if (event === "viewer.onSelectionChanged") onViewerSelection();
-    if (event === "viewer.onModelStateChanged" && state.api) { state.objects = []; state.sel = []; state.rebarIds = null; guarded(start2); }
+    if (event === "viewer.onModelStateChanged" && state.api) scheduleReload();
+  }
+  // Model loaded / streamed in / stage switched: Connect fires several events in a row. Wait until it is quiet for 3 s
+  // (as viewer-assembly-status does), then reload once and keep the selection by GUID; typed drafts stay (F6).
+  // Never two reloads at once: an event during a reload queues one more run (M3 a). The selection to restore is captured
+  // once and kept until a run restores it (M3 a). A selection the user makes during the reload wins (M3 b). The viewer
+  // selection is set again after the restore (M3 c). Writes in flight postpone the reload (M4).
+  let reloadTimer = null, reloading = false, rerun = false, pendingKeep = null, selDuringReload = false;
+  function scheduleReload(ms) {
+    if (pendingKeep == null && !reloading) pendingKeep = state.sel.map((o) => o.guid);
+    clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(runReload, ms == null ? 3000 : ms);
+  }
+  async function runReload() {
+    reloadTimer = null;
+    if (reloading) { rerun = true; return; }
+    if (inflight > 0) { scheduleReload(1000); return; }
+    reloading = true; selDuringReload = false;
+    const keep = new Set(pendingKeep || state.sel.map((o) => o.guid));
+    try {
+      await guarded(async () => {
+        state.objects = []; state.sel = []; state.rebarIds = null;
+        await start2();
+        if (!state.ready) return;
+        if (selDuringReload && state.follow) { await selectionFromViewer(true); pendingKeep = null; return; }
+        const objs = state.objects.filter((o) => keep.has(o.guid));
+        pendingKeep = null;
+        if (!objs.length) { if (keep.size) { setSel([]); render(); } return; }
+        state.sel = objs;   // same GUIDs as before: drafts stay
+        render();
+        const byModel = new Map();
+        for (const o of objs) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
+        try { await state.api.viewer.setSelection({ modelObjectIds: [...byModel].map(([modelId, objectRuntimeIds]) => ({ modelId, objectRuntimeIds })) }, "set"); } catch (e) { console.warn("setSelection after reload failed", e); }
+      });
+    } finally {
+      reloading = false;
+      if (rerun) { rerun = false; scheduleReload(0); }
+    }
   }
   if (window.parent === window) {
     if (/[?&]demo\b/.test(location.search)) { const s = document.createElement("script"); s.src = "demo.js?t=" + Date.now(); document.body.appendChild(s); }
