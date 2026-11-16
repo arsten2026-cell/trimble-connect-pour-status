@@ -38,7 +38,7 @@
 (() => {
   "use strict";
   if (typeof document === "undefined") return;
-  const C = window.PourLogic, S = window.PourStatus, A = window.PsetApi, U = window.PourUi;
+  const C = window.PourLogic, S = window.PourStatus, A = window.PsetApi, U = window.PourUi, LK = window.ArstenLinks;
   const $ = (id) => document.getElementById(id);
   const PROXY = "IfcBuildingElementProxy";
   const BATCH = 200;
@@ -74,6 +74,8 @@
     drafts: {},                              // stepId -> {date?, note?} typed but not saved yet (survives re-renders; week 1, F6)
     draftSel: [],                            // GUIDs of the selection the drafts were typed for (M2)
     confirmOrphan: null,                     // guid of the orphan whose inline "Прехвърли" confirm box is open (week 1, F7)
+    legacy: [],                              // [{guid, kind}] records still under a raw-"$" link: move / stale / merge (F4)
+    backupAsk: null,                         // {act, into?, text}: a destructive action waiting for "Продължи без архив" (M5)
   };
   const objKey = (o) => o.modelId + ":" + o.id;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -193,20 +195,137 @@
   async function loadRecords() {
     // All records of the definition, including objects no longer in the model (needed for merges, splits where the
     // original is gone, and "Статус без обект"). Fallback: only the objects in the model.
+    // "$" links (F4): records are written under the URL-encoded link (S.entityLink); the raw-"$" link of before v36
+    // is read as well. The encoded record wins; raw ones are listed in state.legacy for "Премести" (shared/arsten-links.js).
     const links = state.objects.map((o) => S.entityLink(o.guid));
+    const legacy = state.objects.filter((o) => LK.hasLegacy(o.guid)).map((o) => LK.legacyLink(o.guid));
     // Always also read the objects in the model directly, so a list call that fails or returns less loses nothing.
-    const got = await state.client.readMany(state.lib.id, state.defId, links);
+    const enc = await state.client.readMany(state.lib.id, state.defId, links);
+    const raw = legacy.length ? await state.client.readMany(state.lib.id, state.defId, legacy) : new Map();
+    let listed = [];
     try {
       const all = await state.client.listAll(state.lib.id, state.defId, "frn:entity:");
-      for (const [link, props] of all) if (!got.has(link)) got.set(link, props);
+      listed = [...all];
       state.listMode = "all";
       state.listCount = all.size;
     } catch (e) {
       console.warn("Listing all statuses failed, reading only objects in the model:", e);
       state.listMode = "model";
     }
-    state.records = new Map();
-    for (const [link, props] of got) state.records.set(link.replace(/^frn:entity:/, ""), props);
+    // "$" GUIDs listed but not in the model: read both link forms directly, never trust the form the list returned (M3).
+    const known = new Set(state.objects.map((o) => o.guid));
+    const extra = LK.listedToRead(listed, known);
+    if (extra.length) {
+      const e2 = await state.client.readMany(state.lib.id, state.defId, extra.map(LK.entLink));
+      const r2 = await state.client.readMany(state.lib.id, state.defId, extra.map(LK.legacyLink));
+      for (const x of e2) enc.set(x[0], x[1]);
+      for (const x of r2) raw.set(x[0], x[1]);
+      extra.forEach((g) => known.add(g));
+    }
+    const r = LK.collect({ enc, raw, listed, known });
+    state.records = r.records;
+    state.legacy = r.legacy;
+  }
+  /** Write one object's record under its encoded link (replace: delete + re-create, so fields can be cleared) and
+   *  drop its raw-"$" copy, by the shared rule LK.putRecord: a partial write on "move"/"merge" starts from the shown
+   *  (merged) record (M2); a replace over a raw copy first writes the full record encoded, then drops the raw copy, then
+   *  replaces, so a failed step never brings the old raw record back (M1). */
+  async function putRec(guid, props, replace) {
+    const lg = state.legacy.find((x) => x.guid === guid);
+    const c = state.client, lib = state.lib.id, def = state.defId;
+    const r = await LK.putRecord({
+      write: (l, p) => c.write(lib, def, l, p), replace: (l, p) => c.replace(lib, def, l, p), remove: (l) => c.remove(lib, def, l),
+    }, guid, props, { replace, kind: lg ? lg.kind : null, shown: state.records.get(guid) });
+    state.records.set(guid, r.body);
+    if (r.dropped) state.legacy = state.legacy.filter((x) => x.guid !== guid);
+    return r.body;
+  }
+  // ---------- undo files before mass actions (shared/arsten-backup.js, owner 16.11.2026) ----------
+  const backupCache = new Map();
+  let backupCore = null;
+  const coreFor = () => window.ARSTEN_PHOTOS_CORE || backupCore || (backupCore = ArstenBackup.coreClient(ArstenAccess.coreBase(state.project.location), getToken));
+  /** The links a putRec on these GUIDs touches: the encoded one, plus the raw-"$" copy it deletes. */
+  const linksOf = (guids) => guids.flatMap((g) => [S.entityLink(g)].concat(state.legacy.some((x) => x.guid === g) ? [LK.legacyLink(g)] : []));
+  /** Snapshot of the records an action is about to change or delete (links, read fresh), uploaded to
+   *  _ArstenDocs/Backups/<day>/ before the action runs. Upload failed: the JSON is downloaded in the browser and the
+   *  action goes on with a warning - except a destructive one (o.destructive: Премести, merge), which stops and asks
+   *  "Продължи без архив" (state.backupAsk; o.ask = {act, into}) unless o.noBackupOk (that answer). A failed READ, a
+   *  link returned in another form (M4) or a missing backup module (Low 14) stops the action: nothing changes without
+   *  its undo file. Returns the text added to the result message, or null = stopped, waiting for the answer. */
+  async function backupFirst(action, links, o) {
+    o = o || {};
+    if (!links.length) return "";
+    if (!window.ArstenBackup) throw new Error(L2("Модулът за архив не е зареден – действието е спряно, нищо не е променено. Презаредете панела.",
+      "The backup module is not loaded – the action was stopped, nothing was changed. Reload the panel."));
+    const uniq = [...new Set(links)];
+    let records;
+    try {
+      const now = await state.client.readMany(state.lib.id, state.defId, uniq);
+      records = ArstenBackup.recordsFrom(uniq.map((link) => ({ def: state.defId, link })), new Map([[state.defId, now]]), { decode: LK.guidOfLink });
+    } catch (e) { throw new Error(L2("Архивът не може да се направи – нищо не е променено: ", "The backup could not be made – nothing was changed: ") + errText(e)); }
+    const snap = ArstenBackup.snapshot({ tool: "pour", action, project: state.project, by: state.user, library: state.lib, records });
+    const res = await ArstenBackup.save({ core: coreFor(), projectId: state.project.id, snapshot: snap, cache: backupCache });
+    if (!res.uploaded) {
+      console.warn("backup not uploaded to Connect", res.saved, res.error);
+      if (o.destructive && !o.noBackupOk) {
+        state.backupAsk = Object.assign({ text: ArstenBackup.failedText(lang, res) }, o.ask);
+        report(ArstenBackup.failedText(lang, res) + L2(" – нищо не е променено. Продължете без архив или откажете.", " – nothing was changed. Go on without a backup or cancel."), true);
+        render();
+        return null;
+      }
+      toast(ArstenBackup.failedText(lang, res), true);
+    }
+    return ArstenBackup.note(res, lang);
+  }
+  /** The inline "Продължи без архив" box of a destructive action whose backup was not uploaded (M5). */
+  function backupAskBox() {
+    const a = state.backupAsk;
+    if (!a) return "";
+    const what = a.act === "moveLegacy" ? L2("„Премести“", "\"Move\"") : L2("Обединяването", "The merge");
+    return `<div class="warn" role="alert"><b>${esc(a.text)}</b>
+      <div>${esc(L2(`${what} изтрива или презаписва записи. Без архив в Connect промяната не може да се върне.`, `${what} deletes or overwrites records. Without a backup in Connect it cannot be undone.`))}</div>
+      <div class="bar"><button class="small" data-act="backupGo">${esc(L2("Продължи без архив", "Go on without a backup"))}</button>
+      <button class="small secondary cancel" data-act="backupNo">${esc(L2("Откажи", "Cancel"))}</button></div></div>`;
+  }
+  const BIG = 10;   // a step write over more than this many objects gets an undo file first
+
+  /** "Премести": every record still under a raw-"$" link goes to its URL-encoded link, then the raw one is deleted. Both
+   *  are read fresh; an encoded record only gets the raw fields when the raw one is newer ("merge"); "stale" ones are
+   *  only deleted (LK.movePatch, same rules as Стомана). */
+  async function moveLegacy(noBackupOk) {
+    const list = state.legacy.slice();
+    if (!list.length || !state.lib) return;
+    const bak = await backupFirst("move", list.flatMap((x) => [LK.legacyLink(x.guid), S.entityLink(x.guid)]), { destructive: true, noBackupOk, ask: { act: "moveLegacy" } });
+    if (bak === null) return;
+    let done = 0, failed = 0, first = "";
+    setStatus(`${L2("Преместване", "Moving")}: 0/${list.length}…`);
+    await pool(list, 6, async (x) => {
+      try {
+        const raw = await state.client.readOne(state.lib.id, state.defId, LK.legacyLink(x.guid));
+        const rp = raw && raw.props;
+        if (rp) {
+          const enc = await state.client.readOne(state.lib.id, state.defId, S.entityLink(x.guid));
+          const patch = LK.movePatch(LK.classify(enc && enc.props, rp), enc && enc.props, rp, 4000);   // kind from the two fresh reads (Low 7)
+          if (patch) await state.client.writeIfUnchanged(state.lib.id, state.defId, S.entityLink(x.guid), patch, enc ? enc.v : undefined);
+          await state.client.remove(state.lib.id, state.defId, LK.legacyLink(x.guid));
+        }
+        done++;
+      } catch (e) { failed++; if (!first) first = e.status === 403 ? L2("Нямате права да записвате в библиотеката " + S.LIB_NAME + ".", "You have no permission to write to the library " + S.LIB_NAME + ".") : errText(e); }
+      setStatus(`${L2("Преместване", "Moving")}: ${done + failed}/${list.length}…`);
+    });
+    await loadRecords();
+    report(L2(`Преместени ${done} записа.`, `Moved ${done} records.`)
+      + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
+      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failed > 0);
+    render();
+    if (state.coloured) await applyColours();
+  }
+  function legacyBanner() {
+    const n = state.legacy.length;
+    if (!n) return "";
+    return `<div class="warn">${esc(L2(`${n} записа (тактове с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`,
+      `${n} records (pour objects with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
+      <div class="bar"><button class="small" data-act="moveLegacy">${esc(L2(`Премести (${n})`, `Move (${n})`))}</button></div></div>`;
   }
 
   // ---------- selection ----------
@@ -275,6 +394,7 @@
     const targets = mode === "mark" || mode === "na" ? (partly ? objs.filter((o) => !has(o)) : objs) : objs.filter(has);
     if (!targets.length) return report(lang === "bg" ? "Няма обекти с този етап." : "No objects with this step.", true);
     if (mode === "note" && keepNote) return report(lang === "bg" ? "Напишете бележка." : "Type a note.", true);
+    const bak = targets.length > BIG ? await backupFirst(`${stepId}-${mode}`, linksOf(targets.map((o) => o.guid))) : "";
     let done = 0, failed = 0, firstErr = "";
     setStatus(`${stepName(step)}: 0/${targets.length}…`);
     await pool(targets, 6, async (o) => {
@@ -287,9 +407,7 @@
           note: keepNote ? old[`${stepId}_note`] || "" : note,
           by: state.user, pour: pourOf(o), key: o.key, qty: liveQty(o)[S.STEP_QTY[stepId]], snap: snapOf(o) });
       try {
-        const replace = mode === "undo" || S.clearsField(cur, next);
-        await (replace ? state.client.replace : state.client.write).call(state.client, state.lib.id, state.defId, S.entityLink(o.guid), next);
-        state.records.set(o.guid, next);
+        await putRec(o.guid, next, mode === "undo" || S.clearsField(cur, next));
         done++;
       } catch (e) {
         failed++;
@@ -306,7 +424,7 @@
       if (not.length) warn = " · " + L2(`Внимание: армировката не е приета за ${not.join(", ")}`, `Warning: rebar not accepted for ${not.join(", ")}`);
     }
     if (done && !failed) delete state.drafts[stepId];   // saved: the boxes show the saved values again
-    report(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn, failed > 0 || !!warn);
+    report(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn + bak, failed > 0 || !!warn);
     render();
     if (state.coloured) await applyColours();
   }
@@ -647,6 +765,7 @@
     $("lblHideRebar").textContent = t("hideRebar"); $("chkHideRebar").checked = !!state.rebarHidden;
     $("lblSeeThrough").textContent = t("seeThrough"); $("chkSeeThrough").checked = state.seeThrough;
     if (!state.ready) return;
+    $("legacyBox").innerHTML = backupAskBox() + legacyBanner();   // "Продължи без архив" (M5); raw-"$" records waiting for "Премести" (F4)
     // selection
     const sel = state.sel;
     if (!sel.length) $("selText").innerHTML = `<span class="sub">${esc(t("nothing"))}</span>`;
@@ -769,22 +888,21 @@
   async function splitApply(i) {
     const x = state.splits[i], pieces = splitPieces(i);
     if (!pieces.length) return report(L2("Не са избрани части.", "No pieces ticked."), true);
+    const bak = await backupFirst("split", linksOf([...pieces.map((pc) => pc.guid), x.guid]));
     let done = 0;
     await pool(pieces, 6, async (pc) => {
       const props = S.inherit(x.record, x.guid, { by: state.user, pour: pc.pour, key: pc.key, snap: snapOf(pc.obj) });
-      await state.client.write(state.lib.id, state.defId, S.entityLink(pc.guid), props);
-      state.records.set(pc.guid, props); done++;
+      await putRec(pc.guid, props); done++;
     });
     await splitClose(x, done);
-    report(`${x.record.pour}: ${L2("статусът е прехвърлен на", "status passed on to")} ${done} ${L2("нови части", "new pieces")}`);
+    report(`${x.record.pour}: ${L2("статусът е прехвърлен на", "status passed on to")} ${done} ${L2("нови части", "new pieces")}` + bak);
     render();
     if (state.coloured) await applyColours();
   }
   async function splitClose(x, pieces) {
     const cur = state.objects.find((o) => o.guid === x.guid);
     const next = S.splitDone(x.record, cur ? { by: state.user, snap: snapOf(cur), key: cur.key, pour: pourOf(cur), pieces } : { by: state.user, pieces });
-    await state.client.write(state.lib.id, state.defId, S.entityLink(x.guid), next);
-    state.records.set(x.guid, next);
+    await putRec(x.guid, next);
   }
   async function splitSkip(i) {
     const x = state.splits[i];
@@ -800,18 +918,19 @@
 
   // Pour break removed: write the merged object's record (combined frozen quantities, current outline) and mark the
   // gone pieces' records as merged into it (they leave "Статус без обект").
-  async function mergeApply(i) {
+  async function mergeApply(i, noBackupOk) {
     const x = state.merges[i];
+    if (!x) return;
     const o = state.objects.find((v) => v.guid === x.into);
     const next = S.mergeBack(state.records.get(x.into), x.gone, { by: state.user, snap: o ? snapOf(o) : null, key: o && o.key, pour: o ? pourOf(o) : null });
-    await state.client.write(state.lib.id, state.defId, S.entityLink(x.into), next);
-    state.records.set(x.into, next);
+    const bak = await backupFirst("merge", linksOf([x.into, ...x.gone.map((g) => g.guid)]), { destructive: true, noBackupOk, ask: { act: "mergeApply", into: x.into } });
+    if (bak === null) return;
+    await putRec(x.into, next);
     for (const g of x.gone) {
       const r = S.mergedInto(g.record, x.into, { by: state.user });
-      await state.client.write(state.lib.id, state.defId, S.entityLink(g.guid), r);
-      state.records.set(g.guid, r);
+      await putRec(g.guid, r);
     }
-    report(`${o ? pourOf(o) : ""}: ${L2("обединяването е записано", "merge saved")}`);
+    report(`${o ? pourOf(o) : ""}: ${L2("обединяването е записано", "merge saved")}` + bak);
     render();
   }
   async function mergeShow(i) {
@@ -857,15 +976,16 @@
     if (!x || state.reattachBusy) { if (!x) { state.confirmOrphan = null; render(); } return; }
     state.reattachBusy = true;
     render();
+    let bak = "";
     try {
+      bak = await backupFirst("reattach", linksOf(x.candidates.map((c) => c.guid)));
       for (const c of x.candidates) {
         const props = Object.assign({}, x.record, { key: c.key });
         props.log = (props.log ? props.log + "\n" : "") + `${S.today()} re-attached from ${x.guid} by ${state.user}`;
-        await state.client.write(state.lib.id, state.defId, S.entityLink(c.guid), props);
-        state.records.set(c.guid, props);
+        await putRec(c.guid, props);
       }
     } finally { state.reattachBusy = false; state.confirmOrphan = null; }
-    report(`${x.record.pour || ""}: ${L2("статусът е прехвърлен на", "status re-attached to")} ${x.candidates.length} ${L2("обекта", "objects")}`);
+    report(`${x.record.pour || ""}: ${L2("статусът е прехвърлен на", "status re-attached to")} ${x.candidates.length} ${L2("обекта", "objects")}` + bak);
     render();
     if (state.coloured) await applyColours();
   }
@@ -875,7 +995,7 @@
     const b = e.target.closest("button[data-act]");
     if (!b) return;
     const act = b.dataset.act;
-    const WRITES = ["mark", "undo", "note", "na", "reattachYes", "splitApply", "splitSkip", "mergeApply"];
+    const WRITES = ["mark", "undo", "note", "na", "reattachYes", "splitApply", "splitSkip", "mergeApply", "moveLegacy", "backupGo"];
     if (WRITES.includes(act) && reloading) return report(L2("Моделът се презарежда – опитайте след малко.", "The model is reloading – try again in a moment."), true);
     guarded(() => writing(async () => {
       if (act === "mark" || act === "undo" || act === "note" || act === "na") await applyStep(b.dataset.step, act);
@@ -890,8 +1010,21 @@
       else if (act === "splitApply") await splitApply(+b.dataset.i);
       else if (act === "splitSkip") await splitSkip(+b.dataset.i);
       else if (act === "splitShow") await splitShow(+b.dataset.i);
-      else if (act === "mergeApply") await mergeApply(+b.dataset.i);
+      else if (act === "mergeApply") { state.backupAsk = null; await mergeApply(+b.dataset.i); }
       else if (act === "mergeShow") await mergeShow(+b.dataset.i);
+      else if (act === "moveLegacy") { state.backupAsk = null; await moveLegacy(); }
+      else if (act === "backupNo") { state.backupAsk = null; setStatus(L2("Отказано – нищо не е променено.", "Cancelled – nothing was changed.")); render(); }
+      else if (act === "backupGo") {   // the second, explicit confirmation of a destructive action without an uploaded backup (M5)
+        const a = state.backupAsk;
+        state.backupAsk = null;
+        render();
+        if (a && a.act === "moveLegacy") await moveLegacy(true);
+        else if (a && a.act === "mergeApply") {
+          const k = (state.merges || []).findIndex((m) => m.into === a.into);
+          if (k < 0) report(L2("Обединяването вече не е в списъка – нищо не е променено.", "The merge is no longer listed – nothing was changed."), true);
+          else await mergeApply(k, true);
+        }
+      }
     }));
   });
   $("btnFromViewer").onclick = () => guarded(selectionFromViewer);

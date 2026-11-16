@@ -65,8 +65,10 @@
     };
   }
 
-  /** Link of a model object, the format Connect's property panel uses (file-independent). */
-  const entityLink = (guid) => `frn:entity:${guid}`;
+  /** Link of a model object, the format Connect's property panel uses (file-independent). The GUID is URL-encoded
+   *  ("$" -> "%24"), as Trimble's FRN notation wants; records under the raw "$" link (before v17) are never shown in
+   *  Connect's panel or Tekla - the panels read them too and move them (shared/arsten-links.js, F4 16.11.2026). */
+  const entityLink = (guid) => "frn:entity:" + encodeURIComponent(guid);
 
   /** Today as YYYY-MM-DD in local time. */
   function today(d) {

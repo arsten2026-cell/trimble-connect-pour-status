@@ -17,6 +17,38 @@
   /** Drop empty values: the service has no "empty" for typed fields; leaving a field out means "no value". */
   const clean = (props) => Object.fromEntries(Object.entries(props || {}).filter(([, v]) => v !== null && v !== undefined && v !== ""));
 
+  /** i18n of a definition after adding fields: what is already in Connect (edited by hand) wins - names, labels and
+   *  the order of existing fields; only the labels of new fields are added, and "__prop-order__" puts them at the end. */
+  function mergeI18n(cur, want, missing) {
+    if (!cur) return want;
+    const out = Object.assign({}, cur);
+    for (const [loc, w] of Object.entries(want || {})) {
+      const c = cur[loc];
+      if (!c) { out[loc] = w; continue; }
+      const props = Object.assign({}, c.props || {});
+      if (loc === "__prop-order__") {
+        let next = Math.max(-1, ...Object.values(props).map(Number).filter((n) => Number.isFinite(n))) + 1;
+        const add = missing.filter((k) => !(k in props)).sort((a, b) => Number((w.props || {})[a]) - Number((w.props || {})[b]));
+        for (const k of add) props[k] = String(next++);
+      } else for (const k of missing) if (!(k in props) && w.props && k in w.props) props[k] = w.props[k];
+      out[loc] = Object.assign({}, w, c, { props });
+    }
+    return out;
+  }
+  /** PATCH body that adds only the missing fields to an existing definition (M12): existing field types, name,
+   *  description and i18n stay as they are in Connect. */
+  function extendBody(cur, def, missing) {
+    const props = Object.assign({}, cur.schema.props);
+    for (const k of missing) props[k] = def.schema.props[k];
+    return {
+      name: cur.name || def.name,
+      description: cur.description != null ? cur.description : def.description,
+      schema: Object.assign({}, cur.schema, { props }),
+      i18n: mergeI18n(cur.i18n, def.i18n, missing),
+      v: cur.v,
+    };
+  }
+
   class ApiError extends Error {
     constructor(status, message, body) { super(message); this.status = status; this.body = body; }
   }
@@ -89,9 +121,8 @@
       const have = Object.keys((cur.schema && cur.schema.props) || {});
       const missing = Object.keys(def.schema.props).filter((p) => !have.includes(p));
       if (!missing.length) return { def: cur, created: false };
-      const props = Object.assign({}, cur.schema.props, def.schema.props);
       const upd = await this.request("pset", `libs/${encodeURIComponent(libId)}/defs/${encodeURIComponent(def.id)}`, "PATCH",
-        { name: def.name, description: def.description, schema: { props }, i18n: def.i18n, v: cur.v });
+        extendBody(Object.assign({}, cur, { schema: Object.assign({ props: {} }, cur.schema) }), def, missing));
       return { def: upd, created: false, extended: missing };
     }
 
@@ -110,7 +141,9 @@
     /**
      * Every pset of a definition (also of objects no longer in the model), as the official JS SDK's
      * listPSetsByDefinition: GET libs/{lib}/defs/{def}/psets?top=&skiptoken=&link=, paged by `next`.
-     * Returns Map link -> props (deleted psets skipped).
+     * Returns Map link -> props (deleted psets skipped). Two items of the same object can come back with the same link
+     * text (a "$" GUID stored raw and URL-encoded): the second one is kept under the other form of the link instead of
+     * overwriting the first (callers decode links to GUIDs and re-read such objects in both forms).
      */
     async listAll(libId, defId, linkPrefix) {
       const out = new Map();
@@ -118,7 +151,7 @@
       let path = `libs/${encodeURIComponent(libId)}/defs/${encodeURIComponent(defId)}/psets?${q()}`;
       for (let page = 0; path && page < 200; page++) {
         const res = await this.request("pset", path);
-        for (const p of (res && res.items) || []) if (p && p.link && !p.deleted) out.set(p.link, p.props || {});
+        for (const p of (res && res.items) || []) if (p && p.link && !p.deleted) addListed(out, p.link, p.props || {});
         const next = res && res.next;
         if (!next) break;
         if (/^https?:/.test(next)) {   // absolute link: keep only the part after the service root
@@ -180,7 +213,22 @@
     }
   }
 
-  const lib = { PsetClient, ApiError, hostFor, clean };
+  /** listAll's map insert: never overwrite a link already listed (see listAll). */
+  function addListed(out, link, props) {
+    if (!out.has(link)) return out.set(link, props);
+    const m = /^frn:entity:(.*)$/.exec(link);
+    if (m) {
+      let g = m[1];
+      try { g = decodeURIComponent(g); } catch {}
+      const enc = "frn:entity:" + encodeURIComponent(g), raw = "frn:entity:" + g;
+      const alt = link === enc ? raw : enc;
+      if (alt !== link && !out.has(alt)) return out.set(alt, props);
+    }
+    console.warn("pset listed twice under the same link; the first one is kept", link);
+    return out;
+  }
+
+  const lib = { PsetClient, ApiError, hostFor, clean, extendBody, mergeI18n, addListed };
   if (typeof module === "object" && module.exports) module.exports = lib;
   else root.PsetApi = lib;
 })(typeof self !== "undefined" ? self : this);

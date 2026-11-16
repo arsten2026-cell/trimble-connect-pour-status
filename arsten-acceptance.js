@@ -154,6 +154,22 @@
       log: addLog(r.declog, `${stamp(now)} round ${roundOf(r)}: ${d.decision} by ${d.by || "?"}${comment ? " – " + comment : ""}`) };
   }
 
+  /**
+   * Auto-close of the ToDo (user 16.11.2026): once every request sent with a ToDo has a decision, the ToDo is closed
+   * with a comment listing the results. records = merged records (status from decisions). A request reopened after a
+   * rejection has its todo_id cleared, so it no longer holds the old ToDo open.
+   * @returns null while any request of that ToDo still waits, else {todoId, comment}
+   */
+  function todoOutcome(records, todoId, lang) {
+    if (!todoId) return null;
+    const mine = records.filter((r) => valid(r) && r.todo_id === todoId);
+    if (!mine.length || mine.some((r) => !DECISIONS.includes(r.status))) return null;
+    const bg = lang !== "en";
+    const lines = mine.slice().sort((a, b) => (a.pour + a.step < b.pour + b.step ? -1 : 1))
+      .map((r) => `• ${r.pour} – ${STEPS[r.step][bg ? "bg" : "en"]}: ${STATUS[r.status][bg ? "bg" : "en"]}${r.decided_by ? " (" + r.decided_by + (r.decided ? ", " + r.decided : "") + ")" : ""}${r.comment ? " – „" + r.comment + "“" : ""}`);
+    return { todoId, comment: (bg ? "Всички заявки са решени в панела „Приемане“:\n" : "All requests are decided in the \"Acceptance\" panel:\n") + lines.join("\n") };
+  }
+
   /** Latest request of a pour and step (or null). */
   function latest(records, pour, step) {
     return records.filter((r) => valid(r) && r.pour === pour && r.step === step).sort((a, b) => (a.requested < b.requested ? 1 : -1))[0] || null;
@@ -186,5 +202,5 @@
     return [...new Set(pours)].filter((p) => { const r = latestCovering(records, p, "rebar"); return !r || !(r.status === "approved" || r.status === "remarks"); });
   }
 
-  return { DEF_ID, DEC_ID, STEPS, STATUS, APPROVER_GROUP, full, valid, merge, reqProps, decisionDefinition, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, latest, latestCovering, pourStates, rebarNotApproved, parseObjects, ids };
+  return { DEF_ID, DEC_ID, STEPS, STATUS, APPROVER_GROUP, full, valid, merge, reqProps, decisionDefinition, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, todoOutcome, latest, latestCovering, pourStates, rebarNotApproved, parseObjects, ids };
 });

@@ -1,0 +1,20 @@
+{
+  "panel": "pour-status",
+  "repo": "arsten2026-cell/trimble-connect-pour-status",
+  "id": "7d6bb0f0b9",
+  "built": "2026-11-16T21:53:07.989Z",
+  "files": {
+    "app.js": "26750a3e3c",
+    "common.js": "a04c428e31",
+    "status.js": "157dd5a2f6",
+    "psetapi.js": "cb56112323",
+    "arsten-access.js": "c29c3b3f4f",
+    "arsten-photos.js": "f0a7981489",
+    "arsten-acceptance.js": "585d7387c0",
+    "arsten-links.js": "7bf607a606",
+    "arsten-backup.js": "28ec966847",
+    "manifest.json": "6baf24b101",
+    "icon.svg": "72763c5140",
+    "index.html": "4d7a093b6d"
+  }
+}
