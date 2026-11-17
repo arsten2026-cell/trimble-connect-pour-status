@@ -2,7 +2,7 @@
 // Approved by the owner 16.11.2026: "Backup to JSON, and an automatic undo file before every mass action".
 //  - Before a mass action the panel builds a snapshot of exactly the records the action will change or delete, as they
 //    are now: {tool, action, project, by, at, library, records: [{def, link, props}]}; props null = the record did not exist.
-//  - The snapshot goes as JSON to the project folder _ArstenDocs/Backups/<YYYY-MM-DD>/<tool>-<action>-<HHMMSSmmm>.json
+//  - The snapshot goes as JSON to the project folder _AM_Docs/Backups/<YYYY-MM-DD>/<tool>-<action>-<HHMMSSmmm>.json
 //    (folders created when missing; Core 2.0 files/fs/initiate -> PUT -> files/fs/commit, as shared/arsten-photos.js).
 //  - Upload failed: the same JSON is downloaded in the browser. save() says what happened (saved: "uploaded" |
 //    "downloaded" | "none"); the panel decides whether the action goes on (destructive ones ask again without upload).
@@ -17,7 +17,15 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
-  const ROOT_PATH = ["_ArstenDocs", "Backups"];
+  // The project's tool folder is _AM_Docs (renamed from _ArstenDocs on 17.11.2026, one name for Arsten and Multiplan).
+  // Lookups take _AM_Docs first and fall back to an old _ArstenDocs; only _AM_Docs is ever created.
+  const DOCS = "_AM_Docs", DOCS_OLD = "_ArstenDocs";
+  const pickFolder = (list, name, same) => {
+    const eq = same || ((a, b) => a === b);
+    const isF = (x) => !!x && String(x.type || "").toUpperCase() === "FOLDER";
+    return (list || []).find((x) => isF(x) && eq(x.name, name)) || (name === DOCS ? (list || []).find((x) => isF(x) && eq(x.name, DOCS_OLD)) : undefined);
+  };
+  const ROOT_PATH = [DOCS, "Backups"];
   const VERSION = 1;
   const T = {
     bg: { ok: "Архив: ", failed: "Архивът не е качен в Connect – изтеглен е на компютъра", none: "Архивът НЕ е запазен (нито качен в Connect, нито изтеглен)",
@@ -34,7 +42,7 @@
   }
   /** A safe file-name part: letters (any script), digits, "-" and "_"; everything else becomes "-". */
   const slug = (s) => String(s == null ? "" : s).trim().replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/-+/g, "-").replace(/^-|-$/g, "") || "x";
-  /** {folder: ["_ArstenDocs","Backups","2026-11-16"], name: "steel-fab-import-143005123.json", path: "_ArstenDocs/Backups/2026-11-16/steel-fab-import-143005123.json"}
+  /** {folder: ["_AM_Docs","Backups","2026-11-16"], name: "steel-fab-import-143005123.json", path: "_AM_Docs/Backups/2026-11-16/steel-fab-import-143005123.json"}
    *  (time with milliseconds, so two backups in the same second get different names) */
   function backupPath(tool, action, at) {
     const s = stamp(at);
@@ -259,7 +267,7 @@
       const key = parent + "/" + name;
       if (cache.has(key)) { parent = cache.get(key); continue; }
       const items = itemsOf(await core.req(`folders/${encodeURIComponent(parent)}/items`));
-      const pick = (list) => list.find((x) => String(x.type).toUpperCase() === "FOLDER" && x.name === name);
+      const pick = (list) => pickFolder(list, name);
       let f = pick(items);
       if (!f) {
         try { f = await core.req("folders", "POST", { name, parentId: parent }); }
@@ -307,7 +315,7 @@
   }
 
   /**
-   * Save a snapshot: upload to _ArstenDocs/Backups/<day>/; on any upload error download it in the browser instead.
+   * Save a snapshot: upload to _AM_Docs/Backups/<day>/; on any upload error download it in the browser instead.
    * Never throws. The caller decides whether the action goes on (see saved).
    * opts: {core, projectId, snapshot, cache?, fetch?, sleep?, download?: (name, text) => bool}
    * Returns {saved: "uploaded" | "downloaded" | "none", uploaded, downloaded, path, name, fileId?, error?}.

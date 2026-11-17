@@ -410,7 +410,7 @@
   /** The links a putRec on these GUIDs touches: the encoded one, plus the raw-"$" copy it deletes. */
   const linksOf = (guids) => guids.flatMap((g) => [S.entityLink(g)].concat(state.legacy.some((x) => x.guid === g) ? [LK.legacyLink(g)] : []));
   /** Snapshot of the records an action is about to change or delete (links, read fresh), uploaded to
-   *  _ArstenDocs/Backups/<day>/ before the action runs. Upload failed: the JSON is downloaded in the browser and the
+   *  _AM_Docs/Backups/<day>/ before the action runs. Upload failed: the JSON is downloaded in the browser and the
    *  action goes on with a warning - except a destructive one (o.destructive: Премести, merge), which stops and asks
    *  "Продължи без архив" (state.backupAsk; o.ask = {act, into}) unless o.noBackupOk (that answer). A failed READ, a
    *  link returned in another form (M4) or a missing backup module (Low 14) stops the action: nothing changes without

@@ -1,7 +1,7 @@
 // Arsten site photos: photos attached to model objects, shared by the Arsten 3D-viewer panels (Pour status, Assembly status).
 //
 // Storage (decided 13.11.2026, see side-session-notes/photos-attachments-research.md):
-//  - the image: a project file in _ArstenDocs/Photos/<YYYY-MM-DD>/ (Core 2.0 files/fs/initiate -> PUT -> files/fs/commit),
+//  - the image: a project file in _AM_Docs/Photos/<YYYY-MM-DD>/ (Core 2.0 files/fs/initiate -> PUT -> files/fs/commit),
 //    resized on the device to max 2560 px (JPEG);
 //  - a record per photo in the panel's own property-set library, definition "photo",
 //    link frn:entity:ARSTENPHOTO-{projectId}-{fileId}: who/when/caption/objects -> lists by day without extra calls;
@@ -17,7 +17,15 @@
 
   const DEF_ID = "photo";
   const MAX_PX = 2560, JPEG_Q = 0.85;
-  const ROOT_PATH = ["_ArstenDocs", "Photos"];
+  // The project's tool folder is _AM_Docs (renamed from _ArstenDocs on 17.11.2026, one name for Arsten and Multiplan).
+  // Lookups take _AM_Docs first and fall back to an old _ArstenDocs; only _AM_Docs is ever created.
+  const DOCS = "_AM_Docs", DOCS_OLD = "_ArstenDocs";
+  const pickFolder = (list, name, same) => {
+    const eq = same || ((a, b) => a === b);
+    const isF = (x) => !!x && String(x.type || "").toUpperCase() === "FOLDER";
+    return (list || []).find((x) => isF(x) && eq(x.name, name)) || (name === DOCS ? (list || []).find((x) => isF(x) && eq(x.name, DOCS_OLD)) : undefined);
+  };
+  const ROOT_PATH = [DOCS, "Photos"];
 
   // ---------- pure ----------
   const pad = (n) => String(n).padStart(2, "0");
@@ -383,7 +391,7 @@
 
   /**
    * Which photo files still exist. A photo deleted directly in Connect (Data explorer / Attachments) leaves our record
-   * behind; such photos are hidden. Reads one folder listing per day (_ArstenDocs/Photos/<day>). Returns a Set of
+   * behind; such photos are hidden. Reads one folder listing per day (_AM_Docs/Photos/<day>). Returns a Set of
    * existing file ids, or null when the folders cannot be read (then nothing is hidden).
    */
   async function existingIds(core, projectId, records, o) {
@@ -392,12 +400,14 @@
     const days = [...new Set(live.map(dayOfRec).filter(Boolean))];
     if (!days.length) return new Set();
     const isFolder = (x) => !!x && String(x.type).toUpperCase() === "FOLDER";
-    const children = (items, name) => items.filter((x) => isFolder(x) && x.name === name);
+    const children = (items, name) => { const l = items.filter((x) => isFolder(x) && x.name === name); return l.length || name !== DOCS ? l : items.filter((x) => isFolder(x) && x.name === DOCS_OLD); };
     try {
       const p = await core.req(`projects/${encodeURIComponent(projectId)}`);
       let folder = { id: p.rootId };
       for (const name of ROOT_PATH) {
         const l = await listFolder(core, folder.id);
+        // both _AM_Docs and an old _ArstenDocs: photos may sit in either, so nothing is known to be deleted
+        if (name === DOCS && l.items.some((x) => isFolder(x) && x.name === DOCS) && l.items.some((x) => isFolder(x) && x.name === DOCS_OLD)) return null;
         folder = children(l.items, name)[0];
         if (!folder) return l.complete ? new Set() : null;   // a listing that may be cut off: unknown, nothing is hidden
       }
@@ -631,7 +641,7 @@
       }
     }
 
-    // folders _ArstenDocs/Photos/<day>, created when missing
+    // folders _AM_Docs/Photos/<day>, created when missing
     const folderJobs = new Map();
     function folderFor(day) {   // memoised as a promise: parallel uploads of the same day share one lookup / create
       if (!folderJobs.has(day)) folderJobs.set(day, folderLookup(day).catch((e) => { folderJobs.delete(day); throw e; }));
@@ -645,7 +655,7 @@
         const key = parent + "/" + name;
         if (st.folders.has(key)) { parent = st.folders.get(key); continue; }
         const items = (await listFolder(core, parent)).items;   // every page (round 17 L4)
-        let f = items.find((x) => String(x.type).toUpperCase() === "FOLDER" && x.name === name);
+        let f = pickFolder(items, name);
         if (!f) f = await core.req("folders", "POST", { name, parentId: parent });
         st.folders.set(key, f.id); parent = f.id;
       }
