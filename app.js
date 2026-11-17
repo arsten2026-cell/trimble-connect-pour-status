@@ -155,7 +155,7 @@
     colour: ["Оцвети по статус", "Colour by status"], seeThrough: ["Незапочнатите прозрачни", "Not started see-through"], hideRebar: ["Скрий армировката", "Hide rebar"], orphans: ["Статус без обект", "Status without object"],
     nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
       "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
-    markDone: ["Готово", "Mark done"], undo: ["Отмени", "Undo"], note: ["Бележка (по избор)", "Note (optional)"],
+    markDone: ["Готово", "Mark done"], undo: ["Премахни", "Remove"], note: ["Бележка (по избор)", "Note (optional)"],
     save: ["Запиши", "Save"], without: ["Без", "Without"],
     withoutTip: ["Етапът не важи за обекта (без кофраж / без армировка). Брои се за изпълнен, без количество за фактуриране.",
       "The step does not apply to this object (no formwork / no rebar). Counts as covered, no quantity to invoice."], noteOnly: ["Само бележка", "Note only"],
@@ -165,9 +165,14 @@
     search: ["Търси такт (номер или име)", "Find a pour (number or name)"], selectMatches: ["Избери в модела", "Select in the model"],
     pourConfirm: ["Потвърди – излей", "Confirm – poured"], noMatch: ["Няма такт с това търсене.", "No pour matches the search."],
   };
-  let lang = (() => { try { return localStorage.getItem("arsten.pourStatus.lang") || "bg"; } catch { return "bg"; } })();
+  // one language for all tools (A10): shared key "arsten.lang" (shared/arsten-i18n.js), the old key read once
+  const I18N = window.ArstenI18n, OLD_LANG = ["arsten.pourStatus.lang"];
+  let lang = I18N ? I18N.getLang(OLD_LANG) : "bg";
+  const fmtDate = (d, o) => (I18N ? I18N.fmtDate(d, lang, o) : String(d || ""));
   const t = (k) => (T[k] ? T[k][lang === "bg" ? 0 : 1] : k);
   const L2 = (b, e) => (lang === "bg" ? b : e);
+  // counted forms (round 19 L6): countWord(1, "запис", "записа", "record", "records") = "1 запис"
+  const countWord = (n, one, many, en1, enN) => `${n} ${lang === "bg" ? (Math.abs(Number(n)) === 1 ? one : many) : (Math.abs(Number(n)) === 1 ? en1 : enN)}`;
   const stepName = (s) => (lang === "bg" ? s.bg : s.en);
 
   // Remembered per user (browser) settings (week 3, A7). Every storage access is wrapped (U.readPref / U.writePref).
@@ -205,7 +210,13 @@
   const noWriteText = () => L2("Нямате права да записвате в библиотеката " + S.LIB_NAME + ".", "You have no permission to write to the library " + S.LIB_NAME + ".");
   const selKey = (objs) => objs.map((o) => o.guid).sort().join("|");
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  function setStatus(text, bad) { $("status").textContent = text; $("status").className = "status" + (bad ? " bad" : ""); }
+  // text may be a function: then it is built again in the new language after a language switch (round 19 L4)
+  let statusAgain = null;
+  function setStatus(text, bad) {
+    statusAgain = typeof text === "function" ? { text, bad } : null;
+    $("status").textContent = typeof text === "function" ? text() : text; $("status").className = "status" + (bad ? " bad" : "");
+  }
+  const relabelStatus = () => { if (statusAgain) setStatus(statusAgain.text, statusAgain.bad); if (window.ArstenDiag && ArstenDiag.relabel) ArstenDiag.relabel(); };
   // Result of a write, shown at the bottom of the panel near the finger (week 1, A2); the status line stays as well.
   // The element stays in the DOM (visually hidden when idle) so screen readers announce it; errors use role="alert".
   let toastTimer = null;
@@ -246,12 +257,12 @@
     const p = new Promise((resolve, reject) => {
       done = (tk) => { clearTimeout(timer); resolve(tk); };
       tokenWaiters.push(done);
-      timer = setTimeout(() => { tokenWaiters = tokenWaiters.filter((f) => f !== done); reject(new Error("No access token from Trimble Connect")); }, 60000);
+      timer = setTimeout(() => { tokenWaiters = tokenWaiters.filter((f) => f !== done); reject(new Error(L2("Trimble Connect не даде ключ за достъп", "No access token from Trimble Connect"))); }, 60000);
     });
     const drop = () => { clearTimeout(timer); tokenWaiters = tokenWaiters.filter((f) => f !== done); p.catch(() => {}); };
     let r;
     try { r = await state.api.extension.requestPermission("accesstoken"); } catch (e) { drop(); throw e; }
-    if (r === "denied") { drop(); throw new Error("Access to Trimble Connect data was denied for this extension."); }
+    if (r === "denied") { drop(); throw new Error(L2("Достъпът до данните в Trimble Connect е отказан за това разширение.", "Access to Trimble Connect data was denied for this extension.")); }
     if (r && r !== "pending" && r !== "granted") { drop(); token = r; return r; }
     return p;
   }
@@ -263,7 +274,7 @@
   // ---------- reading pour objects (same rules as Pour tags) ----------
   async function loadPours() {
     const api = state.api;
-    setStatus("Reading pours…");
+    setStatus(L2("Четене на тактовете…", "Reading pours…"));
     let modelObjs = await api.viewer.getObjects({ parameter: { class: PROXY } });
     if (!(modelObjs || []).some((m) => (m.objects || []).length)) modelObjs = await api.viewer.getObjects();
     const items = [];
@@ -301,6 +312,7 @@
     $("setupBox").hidden = true;
     const found = await state.client.findLibrary(state.project.id, S.LIB_NAMES);
     if (!found.lib && found.denied > 0) {
+      console.warn("library not readable", S.LIB_NAME, JSON.stringify({ denied: found.denied }));   // round 19 M1: into the diagnostics
       // A library the user may not read exists: it may be ours, so never ask for a new one (a second CIP/Монолитно; F9).
       showSetup(`<b>${esc(L2("Библиотеката съществува, но нямате достъп до нея – обърнете се към администратора.",
         "The library exists, but you have no access to it – ask the project administrator."))}</b>
@@ -320,7 +332,7 @@
     state.lib = found.lib;
     try {
       const r = await state.client.ensureDefinition(found.lib.id, S.definition());
-      if (r.created) setStatus("Status fields created in the library " + found.lib.name);
+      if (r.created) setStatus(L2("Полетата за статус са създадени в библиотеката ", "Status fields created in the library ") + found.lib.name);
     } catch (e) {
       if (e.status === 403) {
         showSetup(lang === "bg"
@@ -426,7 +438,8 @@
       }
       toast(ArstenBackup.failedText(lang, res), true);
     }
-    return ArstenBackup.note(res, lang);
+    // the path only for the office side; site roles see "Архивът е запазен" (A11)
+    return office() || !I18N ? ArstenBackup.note(res, lang) : " · " + I18N.word("backupSaved", lang);
   }
   /** The inline "Продължи без архив" box of a destructive action whose backup was not uploaded (M5). */
   function backupAskBox() {
@@ -465,7 +478,7 @@
       setStatus(`${L2("Преместване", "Moving")}: ${done + failed}/${list.length}…`);
     });
     await loadRecords();
-    report(L2(`Преместени ${done} записа.`, `Moved ${done} records.`)
+    report(`${L2("Преместени", "Moved")} ${countWord(done, "запис", "записа", "record", "records")}.`
       + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failed > 0);
     render();
@@ -474,7 +487,8 @@
   function legacyBanner() {
     const n = state.legacy.length;
     if (!n || !office()) return "";   // an admin migration task: site roles never see it (A8)
-    return `<div class="warn">${esc(L2(`${n} записа (тактове с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`,
+    return `<div class="warn">${esc(n === 1 ? L2("1 запис (такт с „$“ в GUID) е в стар формат и не се вижда в панела на Connect и в Tekla.",
+      "1 record (a pour object with \"$\" in the GUID) is in the old format and is not shown in Connect's panel or Tekla.") : L2(`${n} записа (тактове с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`,
       `${n} records (pour objects with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
       <div class="bar"><button class="small" data-act="moveLegacy"${canWrite() ? "" : " disabled"}>${esc(L2(`Премести (${n})`, `Move (${n})`))}</button>${canWrite() ? "" : `<span class="sub">${esc(readOnlyText())}</span>`}</div></div>`;
   }
@@ -579,14 +593,14 @@
       }
       setStatus(`${stepName(step)}: ${done}/${targets.length}…`);
     });
-    const verb = mode === "undo" ? L2("отменено", "undone") : mode === "na" ? L2("отбелязано „без“", "marked without") : mode === "note" ? L2("бележка записана", "note saved") : L2("записано", "saved");
+    const verb = mode === "undo" ? L2("премахнато", "removed") : mode === "na" ? L2("отбелязано „без“", "marked without") : mode === "note" ? L2("бележка записана", "note saved") : L2("записано", "saved");
     let warn = "";
     if (stepId === "poured" && mode === "mark" && done && window.ArstenAcceptance) {
       const not = ArstenAcceptance.rebarNotApproved(state.acc || [], targets.map(accPour));
       if (not.length) warn = " · " + L2(`Внимание: армировката не е приета за ${not.join(", ")}`, `Warning: rebar not accepted for ${not.join(", ")}`);
     }
     if (done && !failed) delete state.drafts[stepId];   // saved: the boxes show the saved values again
-    report(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn + bak, failed > 0 || (!!warn && !confirmed));
+    report(`${stepName(step)}: ${verb} ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn + bak, failed > 0 || (!!warn && !confirmed));
     render();
     if (state.coloured) await applyColours();
   }
@@ -629,7 +643,11 @@
       targets: () => state.sel.filter((o) => o.guid).map((o) => ({ modelId: o.modelId, id: o.id, guid: o.guid, label: accPour(o) })),
       onStatus: (text, bad) => { setStatus(text, bad); if (bad) toast(text, true); },
       purposes: window.ArstenAcceptance ? [{ id: "formwork", bg: "За приемане – Кофраж", en: "For acceptance – Formwork" }, { id: "rebar", bg: "За приемане – Армировка", en: "For acceptance – Rebar" }, { id: "both", bg: "За приемане – Кофраж и армировка", en: "For acceptance – Formwork and rebar" }] : [],
-      onUploaded: (u) => guarded(() => writing(() => acceptancePhotos(u))),
+      // round 15, L7: true only when the photos were attached to the request(s); guarded shows the error and returns
+      // nothing, so the photo module offers "Изпрати за приемане сега" only after a success
+      onUploaded: async (u) => { let ok = false; await guarded(async () => { await writing(() => acceptancePhotos(u)); ok = true; }); return ok; },
+      // A9: "Изпрати за приемане сега" right after photos for acceptance are uploaded – the same send as the button below
+      sendNow: canWrite() && window.ArstenAcceptance ? () => guarded(() => writing(sendAcceptance)) : null,
     };
     state.photos = opts;
     opts.ui = ArstenPhotos.mount(opts);
@@ -709,7 +727,7 @@
       const r = A.latest(state.acc, pour, step);
       if (!r) return "";
       const s = A.STATUS[r.status] || A.STATUS.open;
-      return `<div class="sub"><span class="sw" style="background:${s.colour}"></span>${esc(pour)} · ${esc(A.STEPS[step][lang])}: <b>${esc(s[lang])}</b>${r.status === "open" && !r.sent ? L2(" (неизпратена)", " (not sent)") : ""}${r.decided_by ? ` – ${esc(r.decided_by)} ${esc(r.decided)}` : ""}${r.comment ? `<br>„${esc(r.comment)}“` : ""}</div>`;
+      return `<div class="sub"><span class="sw" style="background:${s.colour}"></span>${esc(pour)} · ${esc(A.STEPS[step][lang])}: <b>${esc(s[lang])}</b>${r.status === "open" && !r.sent ? L2(" (не е изпратена към проектанта)", " (not sent to the designer yet)") : ""}${r.decided_by ? ` – ${esc(r.decided_by)} ${esc(fmtDate(r.decided, { time: true }))}` : ""}${r.comment ? `<br>„${esc(r.comment)}“` : ""}</div>`;
     };
     box.innerHTML = pours.map((p) => row(p, "formwork") + row(p, "rebar") + row(p, "both")).join("")
       + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc"${accBusy || !canWrite() ? " disabled" : ""}>${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
@@ -807,7 +825,7 @@
       const s = document.createElement("script");
       s.src = EXCELJS; s.integrity = EXCELJS_SRI; s.crossOrigin = "anonymous";
       s.onload = () => resolve(window.ExcelJS);
-      s.onerror = () => { excelLoad = null; reject(new Error("Could not load the Excel library (" + EXCELJS + ")")); };
+      s.onerror = () => { excelLoad = null; reject(new Error(L2("Библиотеката за Excel не се зареди (", "Could not load the Excel library (") + EXCELJS + ")")); };
       document.head.appendChild(s);
     }));
   }
@@ -1002,7 +1020,7 @@
       const markLabel = armed ? t("pourConfirm") : partly ? `${t("markDone")} (${st.total - st.done})` : st.done ? t("save") : t("markDone");
       return `<div class="step" style="--c:${s.colour}">
         <div class="hd"><span class="nm">${i + 1}. ${esc(stepName(s))}</span><span class="st ${st.state}">${label}</span></div>
-        ${st.dates.length ? `<div class="dates">${esc(st.dates.join(", "))}</div>` : ""}
+        ${st.dates.length ? `<div class="dates">${esc(st.dates.map((d) => fmtDate(d)).join(", "))}</div>` : ""}
         <div class="row"><input type="date" id="date_${s.id}" max="${today}" value="${esc(dateShown)}" title="${v.mixedDate ? esc(L2("различни дати – празно = без промяна", "different dates – empty = keep")) : ""}"><input type="text" id="note_${s.id}" data-mixed="${v.mixedNote ? 1 : 0}" value="${esc(noteShown)}" placeholder="${esc(notePh)}"></div>
         <div class="hint" id="hint_${s.id}">${dr.date != null ? esc(U.dateHint(dr.date, today, lang)) : ""}</div>
         ${rb ? `<div class="accwarn${armed ? " armed" : ""}" role="${armed ? "alert" : "note"}">${esc(U.rebarWarnText(rb, lang))}${armed ? `<div>${esc(L2("Натиснете „Потвърди – излей“, за да запишете въпреки това, или „Откажи“.", "Press \"Confirm – poured\" to save anyway, or \"Cancel\"."))}</div>` : ""}</div>` : ""}
@@ -1033,7 +1051,7 @@
         "These pours were split in Tekla after their formwork/rebar was marked. The new pieces can take over the status.");
       const f3 = (v) => (v == null ? "?" : (Math.round(v * 100) / 100).toLocaleString(lang === "bg" ? "bg-BG" : "en-GB"));
       $("splitRows").innerHTML = sp.map((x, i) => {
-        const what = x.steps.map((id) => `${stepName(S.STEPS.find((s) => s.id === id))}${x.record[id + "_na"] ? " (" + t("without").toLowerCase() + ")" : ""} ${x.record[id + "_date"] || ""}`).join(", ");
+        const what = x.steps.map((id) => `${stepName(S.STEPS.find((s) => s.id === id))}${x.record[id + "_na"] ? " (" + t("without").toLowerCase() + ")" : ""} ${fmtDate(x.record[id + "_date"] || "")}`).join(", ");
         const vol = x.snapVol == null ? `<span class="sub">${L2("няма записан обем – проверете частите", "no saved volume – check the pieces")}</span>`
           : `${L2("обем", "volume")} ${f3(x.snapVol)} m³ ${x.volOk ? "= " : "≠ "}${f3(x.sumVol)} ${x.volOk ? "✓" : "⚠"}`;
         const row = (o, k, ticked, tag) => `<label class="chk"><input type="checkbox" data-split="${i}" data-k="${k}" ${ticked ? "checked" : ""}> ${esc(o.pour || "?")} · ${f3(o.volume)} m³${tag ? ` <span class="sub">${tag}</span>` : ""}</label>`;
@@ -1063,12 +1081,16 @@
     // orphans: only records whose pour is in the loaded models are listed (one stage loaded = the other stages' records
     // are not "without object"); the others are counted for admins (speed audit item 3)
     const orph = dv.orph, hiddenOrph = dv.hiddenOrph;
-    const hiddenNote = office() && hiddenOrph ? L2(`${hiddenOrph} записа на тактове, които не са в заредените модели (други етапи или изтрити тактове), не са в списъка.`,
+    const hiddenNote = office() && hiddenOrph === 1 ? L2("1 запис на такт, който не е в заредените модели (друг етап или изтрит такт), не е в списъка.",
+      "1 record of a pour that is not in the loaded models (another stage or a deleted pour) is not listed.")
+      : office() && hiddenOrph ? L2(`${hiddenOrph} записа на тактове, които не са в заредените модели (други етапи или изтрити тактове), не са в списъка.`,
       `${hiddenOrph} records of pours that are not in the loaded models (other stages or deleted pours) are not listed.`) : "";
     $("orphanBox").hidden = !orph.length && !hiddenNote;
     if (!orph.length && hiddenNote) { $("orphanText").textContent = hiddenNote; $("orphanRows").innerHTML = ""; state.orphans = orph; }
     if (orph.length) {
-      $("orphanText").textContent = (lang === "bg"
+      $("orphanText").textContent = (orph.length === 1 ? L2("1 запис със статус сочи към обект, който вече го няма в модела (вероятно Tekla е пресъздала такта). Свържете го ръчно към новия обект.",
+          "1 status record points to an object that is no longer in the model (Tekla probably rebuilt the pour). Re-attach it to the new object.")
+        : lang === "bg"
         ? `${orph.length} записа със статус сочат към обекти, които вече ги няма в модела (вероятно Tekla е пресъздала такта). Свържете ги ръчно към новия обект.`
         : `${orph.length} status records point to objects that are no longer in the model (Tekla probably rebuilt the pour). Re-attach them to the new object.`) + (hiddenNote ? " " + hiddenNote : "");
       // "Прехвърли" opens an inline Запиши / Откажи box (no window.confirm: Connect's frame can block it; F7)
@@ -1117,7 +1139,7 @@
     const objs = (state.matches || []).flatMap((i) => (state.pours[i] ? state.pours[i].objects : []));
     if (!objs.length) return report(t("noMatch"), true);
     await selectObjects(objs);
-    setStatus(L2(`Избрани ${state.matches.length} такта (${objs.length} обекта)`, `Selected ${state.matches.length} pours (${objs.length} objects)`));
+    setStatus(`${L2("Избрани", "Selected")} ${countWord(state.matches.length, "такт", "такта", "pour", "pours")} (${countWord(objs.length, "обект", "обекта", "object", "objects")})`);
   }
 
   // Pass formwork/rebar of a split pour on to its ticked new pieces; the parent's saved outline becomes the current one.
@@ -1329,7 +1351,7 @@
   $("pourSearch").addEventListener("keydown", (e) => { if (e.key === "Enter" && state.ready && state.filter.trim()) { e.preventDefault(); guarded(selectMatches); } });
   $("btnPickMatches").onclick = () => guarded(selectMatches);
   $("selLang").value = lang;
-  $("selLang").onchange = (e) => { lang = e.target.value; try { localStorage.setItem("arsten.pourStatus.lang", lang); } catch {} render(); if (!state.ready && state.client) loadGuarded(); };
+  $("selLang").onchange = (e) => { lang = I18N ? I18N.setLang(e.target.value) : e.target.value; render(); relabelStatus(); if (!state.ready && state.client) loadGuarded(); };
 
   // Audit item 8 (review round 12, M6): the loaded model set {id@versionId} of the last start2 that finished. A model
   // event that leaves it unchanged (Connect fires them for streaming and visibility too) re-reads no objects and no
@@ -1353,7 +1375,8 @@
     try { await loadAcceptance(); state.accError = ""; } catch (e) { console.error(e); state.accError = (e && e.message) || String(e); }
     mountPhotos();
     // One human sentence for site roles; record counts outside the model and the list fallback only for admins (A8).
-    setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}`
+    const pl = (k, one, many, en1, enN) => (lang === "bg" ? (I18N ? I18N.plural(k, one, many) : many) : (k === 1 ? en1 : enN));
+    setStatus(() => `${state.pours.length} ${pl(state.pours.length, "такт", "такта", "pour", "pours")}, ${n} ${pl(n, "обект", "обекта", "pour object", "pour objects")} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}`
       + (office() && outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : "")
       + (office() && state.listMode === "model" ? L2(" · списъкът на всички записи не се зареди – само обектите в модела", " · listing all records failed – only objects in the model") : ""));
     render();
@@ -1362,14 +1385,17 @@
   async function start(api, client) {
     state.api = api;
     // Access first (shared/arsten-access.js): ADMIN or GENERAL CONTRACTOR group. Nothing is read before.
+    if (window.ArstenDiag) ArstenDiag.set({ panel: "Монолитен бетон (pour-status)", lang: () => lang });   // round 19 M1: before the access check, so a denied screen's diagnostics name the panel
     const demoRole = window.ARSTEN_DEMO ? (/[?&]role=(\w+)/.exec(location.search) || [])[1] || "admin" : "";
     // demo: an admin / GC with write access; ?nowrite = a Connect project admin outside 00_ADMIN (round 11, M3)
     state.access = window.ARSTEN_DEMO ? { allowed: true, role: demoRole, roles: [demoRole],
       caps: /[?&]nowrite\b/.test(location.search) ? [] : demoRole === "admin" ? ["stages", "write"] : ["write"] } : await ArstenAccess.check({ api, getToken, app: "execution" });
+    if (I18N) { lang = await I18N.pickLang(api, state.access, OLD_LANG); $("selLang").value = lang; }   // stored choice, else the Connect user's language
     if (!state.access.allowed) { state.denied = true; state.api = null; ArstenAccess.renderDenied(document.body, lang, state.access); return; }
     state.project = (await api.project.getProject()) || {};
     try { const u = await api.user.getUser(); state.user = [u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || ""; } catch {}
     state.client = client || new A.PsetClient({ region: state.project.location || "europe", getToken });
+    if (window.ArstenDiag) ArstenDiag.set({ panel: "Монолитен бетон (pour-status)", projectId: state.project.id, redact: [state.user], lang: () => lang });   // A23
     render();
     await loadGuarded();
   }
@@ -1446,10 +1472,11 @@
   }
   if (window.parent === window) {
     if (/[?&]demo\b/.test(location.search)) { const s = document.createElement("script"); s.src = "demo.js?t=" + Date.now(); document.body.appendChild(s); }
-    else setStatus("Not inside Trimble Connect. Add this extension to a project and open it from the 3D viewer side panel.", true);
+    else setStatus(I18N ? I18N.word("notInside", lang) : "Not inside Trimble Connect.", true);
     return;
   }
+  if (I18N) setStatus(I18N.word("connecting", lang));
   TrimbleConnectWorkspace.connect(window.parent, onEvent, 30000)
     .then((api) => start(api))
-    .catch((e) => setStatus("Could not connect to Trimble Connect: " + errText(e), true));
+    .catch((e) => setStatus((I18N ? I18N.word("connectFail", lang) : "Could not connect to Trimble Connect") + ": " + errText(e), true));
 })();

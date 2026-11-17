@@ -1,4 +1,4 @@
-# Pour status (Arsten), Trimble Connect 3D-viewer extension
+# Pour status (Arsten / Multiplan), Trimble Connect 3D-viewer extension
 
 Site staff record construction progress on Tekla pour objects (property set `Pour/Такт`): Formwork done, Rebar done,
 Poured, Formwork removed. Each step stores date, who and an optional note, with a history; steps can be corrected

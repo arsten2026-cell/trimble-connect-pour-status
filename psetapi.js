@@ -98,6 +98,7 @@
     for (const [k, c] of memCache) if (test(k, c && c.val)) memCache.delete(k);
   }
   const CHECK_MS = 60000;   // findLibrary: a cached library is checked by name at most once a minute (round 12 L5)
+  const MISS_MS = 2 * 60000;   // findLibrary: "not found" / "no read right" is kept this long (round 17 L1)
   const READ_POOL = 4;      // readMany: batch-get chunks at once (round 12 M3)
   const libJobs = new Map();   // findLibrary lookups running in this page, by cache key (shared by concurrent callers)
   const normName = (x) => String(x || "").replace(/\s+/g, "").toLowerCase();
@@ -295,7 +296,12 @@
 
     /** Find the project library with one of these names (first match in list order wins; case and spaces ignored).
      *  Returns {lib, others, denied} (others: names seen, for messages). A library found is kept in the session cache
-     *  for 10 minutes (opts.fresh: look it up again); "not found" is never cached. A cached library is checked with one
+     *  for 10 minutes (opts.fresh: look it up again). "Not found" (also when the only match may not be read: denied > 0)
+     *  is kept for MISS_MS = 2 minutes in the same cache (round 17 L1: a project without STEEL paid the full lookup on
+     *  every Статус load); opts.fresh bypasses it, and a library found later replaces it. Round 18 L5: that miss is shared by
+     *  every panel in the browser tab (sessionStorage) and survives a reload, so a library created or opened to the user
+     *  less than 2 minutes ago still reads as missing / denied; a write that must see it (Статус publishing) passes
+     *  {fresh: true}. A cached library is checked with one
      *  GET libs/{id} before it is used (review 10 L2): renamed (its name no longer one of `names`), deleted (404) or
      *  closed (403) drops it and the full lookup runs - so nobody reads or writes a renamed library for 10 minutes.
      *  Round 12 L5: that check runs at most once a minute per library and browser tab (CHECK_MS; the time is kept in the
@@ -319,6 +325,10 @@
       const key = libKey(this.region, projectId, list);
       if (!(opts && opts.fresh)) {
         const e = cacheRead(key, true), c = e && e.val;
+        if (c && c.miss && !c.lib) {
+          const age = now() - e.at;
+          if (age >= 0 && age < MISS_MS) return { lib: null, others: c.others || [], denied: c.denied || 0, cached: true };
+        }
         if (c && c.lib && c.lib.id != null) {
           const age = now() - (typeof c.checkedAt === "number" ? c.checkedAt : e.at);
           if (age >= 0 && age < CHECK_MS) return { lib: c.lib, others: c.others || [], denied: c.denied || 0, cached: true };
@@ -354,6 +364,7 @@
       hits.sort((a, b) => a.rank - b.rank);
       const out = { lib: hits.length ? hits[0].lib : null, others, denied };
       if (out.lib && out.lib.id != null) cacheWrite(key, Object.assign({ checkedAt: now() }, out));
+      else cacheWrite(key, Object.assign({ miss: true }, out));   // round 17 L1: kept MISS_MS (fresh bypasses it)
       return out;
     }
 
@@ -490,7 +501,7 @@
     return out;
   }
 
-  const lib = { PsetClient, ApiError, hostFor, clean, extendBody, mergeI18n, addListed, mapLimit, forgetLibrary, CACHE_MS, CHECK_MS, READ_POOL,
+  const lib = { PsetClient, ApiError, hostFor, clean, extendBody, mergeI18n, addListed, mapLimit, forgetLibrary, CACHE_MS, CHECK_MS, MISS_MS, READ_POOL,
     TIMEOUT_MS, UPLOAD_TIMEOUT_MS, TIMEOUT_TEXT, RETRY_TRIES, fetchText, mayRetry, retryWait,
     /** Empty the session cache (for this browser tab: all panels). */
     clearCache: () => cacheDrop(() => true),

@@ -97,6 +97,111 @@
   function parseObjects(s) { try { const a = JSON.parse(s || "[]"); return Array.isArray(a) ? a : []; } catch { return []; } }
   const fmtSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
+  // ---------- upload queue (week 4, A9) ----------
+  // Each chosen photo is one queue item {id, name, file, ctx: {objs, caption, labels, purpose}, state, bad, done}. The
+  // item keeps what it was uploaded FOR (objects, caption, purpose), so "Опитай пак" sends it to the same pours even when
+  // the selection has changed since. A failed item keeps its File and whatever already went through (fileId, links), so
+  // a retry continues from the failed step: a photo whose file is in Connect but whose record failed is not uploaded twice.
+  // The queue lives per project for the whole page session (sessionQueue): closing and opening the panel's section or a
+  // remount keeps the failed photos; a page reload loses them (the browser cannot keep File objects).
+  let itemSeq = 0;
+  const SESSION = new Map();   // projectId -> queue array
+  function sessionQueue(projectId) {
+    const k = String(projectId || "");
+    if (!SESSION.has(k)) SESSION.set(k, []);
+    return SESSION.get(k);
+  }
+  const isPhotoFile = (f) => !!f && (/^image\//.test(f.type || "") || /\.(jpe?g|png|heic|webp)$/i.test(f.name || ""));
+  /** Queue items for these files (non-images dropped); ctx is shared by the batch. */
+  function queueItems(files, ctx, state) {
+    return [...(files || [])].filter(isPhotoFile).map((file) => ({ id: ++itemSeq, name: file.name, file, ctx, state: state || "", bad: false, done: false }));
+  }
+  /** Items "Опитай пак" can send again: failed, not done, with the File or an already uploaded file id; or saved but
+   *  with native object links still missing for some models (round 15, L10: only those are made again). */
+  const canRetry = (q) => !!q && !q.busy && ((q.bad && !q.done && !!(q.file || q.fileId)) || (q.done && !!q.linkMissing && !!q.fileId));
+  const retryable = (queue) => (queue || []).filter(canRetry);
+  /** Hand the uploaded photos to onUploaded (acceptance), one call per purpose and set of objects. True only when every
+   *  call went through: it neither threw nor returned false (round 15, L7: the panel's guarded handler returns false
+   *  instead of throwing). No handler: true. */
+  async function handOver(groups, onUploaded) {
+    if (!onUploaded) return true;
+    let ok = true;
+    for (const u of groups || []) {
+      try { if ((await onUploaded(u)) === false) ok = false; }
+      catch (e) { ok = false; console.warn("photos: handing over failed", e); }
+    }
+    return ok;
+  }
+  /** What the queue shows: every failed item (they must not scroll away) plus the last n others, in queue order. */
+  function queueView(queue, n = 6) {
+    const list = queue || [], others = list.filter((q) => !q.bad);
+    const keep = new Set([...list.filter((q) => q.bad || canRetry(q)), ...others.slice(-n)]);
+    return list.filter((q) => keep.has(q));
+  }
+  /** Done items dropped (after a while they are only noise); failed ones stay. Mutates and returns the queue. */
+  function queuePrune(queue, keepDone = 6) {
+    const done = queue.filter((q) => q.done && !q.linkMissing), drop = new Set(done.slice(0, Math.max(0, done.length - keepDone)));
+    for (let i = queue.length - 1; i >= 0; i--) if (drop.has(queue[i])) queue.splice(i, 1);
+    return queue;
+  }
+  /**
+   * Upload one queue item, continuing after its last successful step. d: {prepare(file), folderFor(day),
+   * upload(folderId, name, blob, track), links(fileId, objs), write(link, rec), projectId, user, texts {up, orig, done, fail,
+   * noNative}, newId(), onProgress()}. Returns the saved record (with link) or null when it failed (item.bad, state =
+   * reason; the File is kept for a retry). On success the File and image are released.
+   */
+  async function processItem(q, d) {
+    const t = d.texts || {}, objs = q.ctx.objs || [];
+    const tick = () => { if (d.onProgress) d.onProgress(q); };
+    q.bad = false; q.done = false; q.busy = true; q.state = `${t.up || "…"}…`; tick();
+    try {
+      if (!q.fileId) {
+        const img = q.img || (q.img = await d.prepare(q.file));
+        q.state = `${fmtSize(img.size)} (${t.orig || ""} ${fmtSize(img.originalSize)}) – ${t.up || ""}…`; tick();
+        // round 15, M3: the file name and folder are fixed ONCE per queued photo (were built again on every attempt with
+        // a new random id). q.up also carries what the upload got to (started, uploadId, put), so a retry after a commit
+        // that timed out or finished late finds the file already in Connect instead of uploading a second copy.
+        if (!q.up) {
+          const day = dayOf(img.taken);
+          q.up = { day, name: fileName(img.taken, q.ctx.labels, d.newId ? d.newId() : Math.random().toString(36).slice(2, 6)), folderId: null };
+        }
+        if (!q.up.folderId) q.up.folderId = await d.folderFor(q.up.day);
+        q.meta = { file_name: q.up.name, day: q.up.day, taken: isoLocal(img.taken), size: `${img.w}x${img.h} ${fmtSize(img.size)}` };
+        q.fileId = await d.upload(q.up.folderId, q.up.name, img.blob, q.up);
+      }
+      if (!q.linked || q.linkMissing) {
+        // round 15, L10: links are made per model; the ones made stay in the record even when a later model fails, and a
+        // retry makes only the models still missing
+        const doneModels = new Set(q.linkedModels || []);
+        const todo = objs.filter((o) => !doneModels.has(o.modelId));
+        const have = q.links || [];
+        try {
+          const got = (await d.links(q.fileId, todo)) || [];
+          q.links = have.concat(got); todo.forEach((o) => doneModels.add(o.modelId));
+          q.linkErr = ""; q.linkMissing = false;
+        } catch (e) {
+          q.links = have.concat((e && Array.isArray(e.links) && e.links) || []);
+          ((e && Array.isArray(e.models) && e.models) || []).forEach((m) => doneModels.add(m));
+          q.linkErr = (e && e.message) || String(e); q.linkMissing = true;
+        }
+        q.linkedModels = [...doneModels];
+        q.linked = true;
+      }
+      const rec = Object.assign({ file_id: q.fileId }, { file_name: q.meta.file_name, day: q.meta.day, taken: q.meta.taken }, {
+        uploaded: isoLocal(new Date()), by: d.user || "", caption: q.ctx.caption || "", labels: (q.ctx.labels || []).join(", "),
+        objects: JSON.stringify(objs.map((o) => ({ modelId: o.modelId, guid: o.guid, label: o.label || "" }))),
+        links: (q.links || []).join(","), size: q.meta.size, deleted: false, purpose: q.ctx.purpose || "" });
+      const link = photoLink(d.projectId, q.fileId);
+      await d.write(link, rec);
+      q.done = true; q.file = null; q.img = null;
+      q.state = `${t.done || "ok"}${(q.links || []).length && !q.linkMissing ? "" : " · " + (t.noNative || "") + (q.linkErr ? ` (${q.linkErr})` : "")}`;
+      return Object.assign({ link }, rec);
+    } catch (e) {
+      q.bad = true; q.state = `${t.fail || "error"}: ${(e && e.message) || e}`;
+      return null;
+    } finally { q.busy = false; tick(); }
+  }
+
   // ---------- network: timeout, retry, perf (review round 12, M1 / M2 / ?perf=1) ----------
   // The same rules as PsetClient.request in psetapi.js (this file must also work alone; change them together):
   //  - every call is aborted after TIMEOUT_MS (30 s; an upload's PUT: UPLOAD_TIMEOUT_MS, 120 s), the body read included,
@@ -178,24 +283,101 @@
   }
 
   // ---------- Core API (browser) ----------
-  /** fetchImpl, opts {timeoutMs, tries, sleep}: tests. */
+  /** fetchImpl, opts {timeoutMs, tries, sleep}: tests. req(path, method, body, extra): extra.headers are sent too, and
+   *  with extra.full the answer is {full: true, data, status, headers} (listFolder reads the paging headers). */
   function coreClient(base, getToken, fetchImpl, opts) {
     const f = fetchImpl || ((...a) => fetch(...a));
     const o = opts || {};
-    async function req(path, method = "GET", body) {
+    async function req(path, method = "GET", body, extra) {
       const what = `Core ${method} ${path.split("?")[0]}`;
+      const x = extra || {};
       for (let attempt = 0; attempt < 3; attempt++) {
         const token = await getToken(attempt > 0);
-        const got = await send(f, base + path, { method, headers: Object.assign({ Authorization: "Bearer " + token }, body !== undefined ? { "Content-Type": "application/json" } : {}),
+        const got = await send(f, base + path, { method, headers: Object.assign({ Authorization: "Bearer " + token }, body !== undefined ? { "Content-Type": "application/json" } : {}, x.headers || {}),
           body: body !== undefined ? JSON.stringify(body) : undefined }, { path, what, ms: o.timeoutMs, tries: o.tries, sleep: o.sleep });
         const res = got.res;
         if (res.status === 401 && attempt < 2) continue;
         let data = null; try { data = got.text ? JSON.parse(got.text) : null; } catch { data = got.text; }
         if (!res.ok) throw failure(`${what}: ${res.status} ${(data && (data.message || data.errorcode)) || ""}`.trim(), got);
-        return data;
+        return x.full ? { full: true, data, status: res.status, headers: res.headers || null } : data;
       }
     }
     return { req };
+  }
+
+  // ---------- folder listings: paging, and "may be cut off" (round 17 L4) ----------
+  // Core 2.0 GET folders/{id}/items is called without a Range header (a non-standard Range would need Connect's CORS to
+  // allow it). The answer is checked: a v2-style answer ({items, links.next.href} / skipToken / nextToken) and a legacy
+  // 206 with "Content-Range: items 0-99/250" are followed page by page. A listing without paging information whose
+  // length is a usual page size (PAGE_SIZES), a 206 whose range cannot be read, a "total" larger than what came, or more
+  // than MAX_PAGES pages counts as "possibly incomplete" (complete: false). Callers never conclude from a name missing in
+  // such a listing that a file is not there: no photo is hidden as deleted, and a retry does not read it as "not
+  // uploaded" (it then uploads under the SAME name, which Connect keeps as a new version of that file, not a copy).
+  const PAGE_SIZES = [50, 100, 200, 250, 500, 1000, 2000, 5000];
+  const MAX_PAGES = 100;
+  const itemsOf = (d) => (Array.isArray(d) ? d : d && Array.isArray(d.items) ? d.items : d && Array.isArray(d.data) ? d.data : []);
+  const hdr = (h, k) => { try { return h && typeof h.get === "function" ? h.get(k) : null; } catch { return null; } };
+  /** All items of a folder: {items, complete}. */
+  async function listFolder(core, folderId) {
+    const path = `folders/${encodeURIComponent(folderId)}/items`;
+    const page = async (p, headers) => {
+      const r = await core.req(p, "GET", undefined, headers ? { full: true, headers } : { full: true });
+      return r && r.full === true && "data" in r ? r : { data: r, status: 200, headers: null };   // a core that gives data only
+    };
+    let r = await page(path), items = itemsOf(r.data).slice();
+    for (let n = 1; ; n++) {
+      const d = r.data && !Array.isArray(r.data) ? r.data : {};
+      const next = (d.links && d.links.next && (d.links.next.href || d.links.next)) || d.next || d.nextLink || null;
+      const token = d.skipToken || d.nextToken || d.continuationToken || null;
+      const cr = /^\s*items\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(hdr(r.headers, "Content-Range") || "");
+      let nextPath = null, nextHeaders = null;
+      if (typeof next === "string" && next) {
+        const m = /\/tc\/api\/2\.[01]\/(.*)$/.exec(next);
+        nextPath = /^https?:/i.test(next) ? (m ? m[1] : null) : next.replace(/^\//, "");
+        if (!nextPath) return { items, complete: false };
+      } else if (token) nextPath = `${path}?skipToken=${encodeURIComponent(token)}`;
+      else if (cr) {
+        const start = Number(cr[1]), end = Number(cr[2]), total = cr[3] === "*" ? NaN : Number(cr[3]);
+        if (!(end + 1 < total)) return { items, complete: cr[3] !== "*" };
+        nextPath = path; nextHeaders = { Range: `items=${end + 1}-${end + 1 + (end - start)}` };
+      } else {
+        const total = Number(d.total != null ? d.total : d.totalCount != null ? d.totalCount : NaN);
+        const complete = r.status !== 206 && (isFinite(total) ? items.length >= total : !(n === 1 && PAGE_SIZES.includes(items.length)));
+        return { items, complete };
+      }
+      if (n >= MAX_PAGES) return { items, complete: false };
+      try { r = await page(nextPath, nextHeaders); } catch (e) { console.warn("folder listing: next page failed", e); return { items, complete: false }; }
+      const more = itemsOf(r.data);
+      if (!more.length) return { items, complete: false };
+      items = items.concat(more);
+    }
+  }
+  const isFile = (x) => !!x && String(x.type || "FILE").toUpperCase() !== "FOLDER";
+  /** Per batch (round 17 L4): each folder is listed once and shared by every photo of the batch; a name not in it lists
+   *  the folder once more (a commit may have finished since), then that answer stays. find -> {id, complete}. */
+  function folderLister(core) {
+    const jobs = new Map();   // folderId -> {p: Promise<{byName, complete}>, refreshed}
+    const load = (folderId) => listFolder(core, folderId).then(({ items, complete }) => {
+      const byName = new Map();
+      for (const x of items) if (isFile(x) && x.name != null && !byName.has(x.name)) byName.set(x.name, x.id);
+      return { byName, complete };
+    });
+    const get = (folderId, fresh) => {
+      let j = jobs.get(folderId);
+      if (!j || fresh) {
+        j = { p: load(folderId), refreshed: !!fresh || !!(j && j.refreshed) };
+        const mine = j;
+        j.p.catch(() => { if (jobs.get(folderId) === mine) jobs.delete(folderId); });   // a failed listing is not kept
+        jobs.set(folderId, j);
+      }
+      return j;
+    };
+    async function find(folderId, name) {
+      let j = get(folderId), l = await j.p;
+      if (!l.byName.has(name) && !j.refreshed) { j = get(folderId, true); l = await j.p; }
+      return { id: l.byName.get(name) || null, complete: l.complete };
+    }
+    return { find, list: (folderId) => get(folderId).p };
   }
 
 
@@ -204,22 +386,45 @@
    * behind; such photos are hidden. Reads one folder listing per day (_ArstenDocs/Photos/<day>). Returns a Set of
    * existing file ids, or null when the folders cannot be read (then nothing is hidden).
    */
-  async function existingIds(core, projectId, records) {
-    const days = [...new Set(records.filter((r) => !r.deleted).map((r) => r.day || String(r.taken || "").slice(0, 10)).filter(Boolean))];
+  async function existingIds(core, projectId, records, o) {
+    const dayOfRec = (r) => r.day || String(r.taken || "").slice(0, 10);
+    const live = records.filter((r) => !r.deleted);
+    const days = [...new Set(live.map(dayOfRec).filter(Boolean))];
     if (!days.length) return new Set();
-    const list = async (id) => { const it = (await core.req(`folders/${encodeURIComponent(id)}/items`)) || []; return Array.isArray(it) ? it : it.items || []; };
-    const child = (items, name) => items.find((x) => String(x.type).toUpperCase() === "FOLDER" && x.name === name);
+    const isFolder = (x) => !!x && String(x.type).toUpperCase() === "FOLDER";
+    const children = (items, name) => items.filter((x) => isFolder(x) && x.name === name);
     try {
       const p = await core.req(`projects/${encodeURIComponent(projectId)}`);
       let folder = { id: p.rootId };
-      for (const name of ROOT_PATH) { folder = child(await list(folder.id), name); if (!folder) return new Set(); }
-      const dayFolders = await list(folder.id), out = new Set();
-      for (const day of days) {
-        const f = child(dayFolders, day);
-        if (f) for (const x of await list(f.id)) if (String(x.type).toUpperCase() !== "FOLDER") out.add(x.id);
+      for (const name of ROOT_PATH) {
+        const l = await listFolder(core, folder.id);
+        folder = children(l.items, name)[0];
+        if (!folder) return l.complete ? new Set() : null;   // a listing that may be cut off: unknown, nothing is hidden
       }
+      const top = await listFolder(core, folder.id), out = new Set(), unsure = new Set();
+      // round 17 L4: the day folders are listed 4 at a time (were one after the other). A day whose listing may be cut
+      // off, or whose folder is missing from a listing that may be cut off, keeps all its photos: "deleted" needs a
+      // complete listing.
+      await mapLimit(days, (o && o.limit) || 4, async (day) => {
+        const fs = children(top.items, day);
+        if (!fs.length) { if (!top.complete) unsure.add(day); return; }
+        for (const f of fs) {   // every folder of that name (a second one may have been made by hand)
+          const l = await listFolder(core, f.id);
+          if (!l.complete) unsure.add(day);
+          for (const x of l.items) if (!isFolder(x)) out.add(x.id);
+        }
+      });
+      for (const r of live) if (r.file_id && unsure.has(dayOfRec(r))) out.add(r.file_id);
       return out;
     } catch (e) { console.warn("photo files could not be checked", e); return null; }
+  }
+  /** fn over items, at most limit at once; results in input order. */
+  async function mapLimit(items, limit, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    const worker = async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); } };
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+    return out;
   }
 
   // ---------- image ----------
@@ -296,15 +501,95 @@
       none: "Няма снимки.", noneSel: "Няма снимки за избраното.", up: "Качване", done: "качена", fail: "грешка", show: "Покажи в модела", del: "Изтрий",
       delAsk: "Да се изтрие ли снимката? Това не може да се отмени.", yes: "Да, изтрий", no: "Не", close: "Затвори", orig: "оригинал",
       gone: "{n} снимки са изтрити в Connect и са скрити.", markFor: "За приемане…", pick: "Избери", pickDone: "Отказ", picked: "Избрани", apply: "Приложи", choosePurpose: "Изберете за какво (кофраж / армировка).",
-      native: "Връзка в Connect", openNew: "Отвори в нов прозорец", zoom: "Щракнете за увеличение", noNative: "без връзка в Connect (само в нашия списък)", loading: "Зареждане…" },
+      native: "Връзка в Connect", openNew: "Отвори в нов прозорец", zoom: "Щракнете за увеличение", noNative: "без връзка в Connect (само в нашия списък)", loading: "Зареждане…",
+      retry: "Опитай пак", retryAll: "Опитай пак всички ({n})", drop1: "Премахни", sendNow: "Изпрати за приемане сега", sendLater: "По-късно", sendAsk: "Снимките са добавени към заявка за приемане." },
     en: { title: "Photos", add: "Add photos", camera: "Camera", drop: "Drop photos here or choose files", caption: "Caption (optional)",
       needSel: "Select object(s) in the model to add photos to them.", to: "To", sel: "For the selection", all: "All by day", filter: "Filter (pour / mark)",
       none: "No photos.", noneSel: "No photos for the selection.", up: "Uploading", done: "uploaded", fail: "failed", show: "Show in model", del: "Delete",
       delAsk: "Delete this photo? This cannot be undone.", yes: "Yes, delete", no: "No", close: "Close", orig: "original",
       gone: "{n} photos were deleted in Connect and are hidden.", markFor: "For acceptance…", pick: "Select", pickDone: "Cancel", picked: "Selected", apply: "Apply", choosePurpose: "Choose what for (formwork / rebar).",
-      native: "Linked in Connect", openNew: "Open in new window", zoom: "Click to zoom", noNative: "not linked in Connect (our list only)", loading: "Loading…" },
+      native: "Linked in Connect", openNew: "Open in new window", zoom: "Click to zoom", noNative: "not linked in Connect (our list only)", loading: "Loading…",
+      retry: "Try again", retryAll: "Try all again ({n})", drop1: "Remove", sendNow: "Send for acceptance now", sendLater: "Later", sendAsk: "The photos were added to an acceptance request." },
   };
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  // ---------- upload of one file, safe to retry (round 15, M3) ----------
+  /** Id of the file called name in folderId (one folder listing), or null. */
+  async function findInFolder(core, folderId, name) {
+    const f = (await listFolder(core, folderId)).items.find((x) => isFile(x) && x.name === name);
+    return f ? f.id : null;
+  }
+  const commitId = (done) => done && (done.id || done.fileId || (done.file && done.file.id) || (done.data && done.data.id)) || null;
+  /**
+   * Upload blob as folderId/name: initiate, PUT (put(url, blob) -> Response), commit; a commit that answers without an
+   * id is looked up in the folder (o.lookTries x o.lookMs, default 10 x 800 ms: commit can finish asynchronously).
+   * track (the queue item's q.up, kept between attempts) records how far it got: {started, uploadId, put}. On a retry
+   * (track.started) the file is first looked for under the SAME name in the same folder - a commit that timed out or
+   * finished after the lookup gave up has put it there - and, when the bytes were already sent, the same upload id is
+   * committed again; only when neither finds the file is a new upload started. So a retry never adds a second copy.
+   * o.find(folderId, name) -> {id, complete}: the batch's folderLister (one listing per batch, round 17 L4); default:
+   * one listing of the folder.
+   */
+  async function uploadFile(core, put, folderId, name, blob, track, o) {
+    const t = track || {}, opt = o || {};
+    const tries = opt.lookTries != null ? opt.lookTries : 10, ms = opt.lookMs != null ? opt.lookMs : 800;
+    const look = async () => {
+      for (let i = 0; i < tries; i++) { await pause(ms); const id = await findInFolder(core, folderId, name); if (id) return id; }
+      return null;
+    };
+    if (t.started) {
+      const found = opt.find ? (await opt.find(folderId, name)).id : await findInFolder(core, folderId, name);
+      if (found) return found;
+      if (t.uploadId && t.put) {
+        let id = null;
+        try { id = commitId(await core.req("files/fs/commit", "POST", { uploadId: t.uploadId })) || (await look()); }
+        catch (e) { id = await findInFolder(core, folderId, name); }
+        if (id) return id;
+      }
+      // still not found: a new upload under the SAME name. If the listing may have been cut off (listFolder complete:
+      // false) the file can still be there; Connect then keeps this upload as a new version of it, not a second file.
+    }
+    t.started = true; t.uploadId = null; t.put = false;
+    const init = await core.req("files/fs/initiate", "POST", { parentId: folderId, parentType: "FOLDER", name });
+    t.uploadId = (init && init.uploadId) || null;
+    const res = await put(init.uploadURL, blob);
+    if (!res || !res.ok) throw new Error(`upload PUT ${res ? res.status : "?"}`);
+    t.put = true;
+    const done = await core.req("files/fs/commit", "POST", { uploadId: init.uploadId });
+    const id = commitId(done) || (await look());
+    if (!id) throw new Error("upload: file id not returned");
+    return id;
+  }
+  /** Native object links of a file, one model at a time (getModels() -> viewer models, for the version). Returns the link
+   *  ids. A failure on a later model throws an error that carries what was made before it (round 15, L10): e.links (link
+   *  ids) and e.models (model ids fully linked), so the caller keeps them and retries only the rest. */
+  async function linkObjects(core, getModels, fileId, objs) {
+    const out = [], doneModels = [];
+    let models = [];
+    try { models = (await getModels()) || []; } catch {}
+    const byModel = new Map();
+    for (const o of objs || []) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.guid); }
+    try {
+      for (const [modelId, guids] of byModel) {
+        const m = models.find((x) => x.id === modelId) || {};
+        const data = guids.map((g) => ({ sourceId: g, type: "BIMOBJECT" }));
+        const target = { id: fileId, type: "FILE" };
+        // Plain model file: source = {file id, version}. With "modelId" Connect answers 400 "Object link modelId is not
+        // enabled" (live 1028, 13.11.2026); the web app adds modelId only for another kind of model, so it is the fallback.
+        let r;
+        try { r = await core.req("objectlink", "POST", { source: { id: modelId, versionId: m.versionId || undefined, data }, target }); }
+        catch (e) { if (e.status !== 400) throw e; r = await core.req("objectlink", "POST", { source: { id: modelId, versionId: m.versionId || undefined, modelId, data }, target }); }
+        const id = r && (r.id || (Array.isArray(r) && r[0] && r[0].id));
+        if (id) out.push(id);
+        doneModels.push(modelId);
+      }
+    } catch (e) {
+      const err = e && typeof e === "object" ? e : new Error(String(e));
+      err.links = out.slice(); err.models = doneModels.slice();
+      throw err;
+    }
+    return out;
+  }
 
   /**
    * Mount the Photos section.
@@ -312,12 +597,22 @@
    *       canAdd, canDeleteAny, lang ("bg"|"en"), targets(): [{modelId, id, guid, label}] (current selection),
    *       onStatus(text, bad), purposes: [{id, bg, en}] (optional upload purposes besides "general"),
    *       onUploaded({purpose, fileIds, objects}) (optional; after each batch with a purpose, and when existing photos
-   *       are marked for a purpose afterwards – from the photo viewer or with "Избери" on several photos)
+   *       are marked for a purpose afterwards – from the photo viewer or with "Избери" on several photos),
+   *       sendNow() (optional, A9; after photos for a purpose were uploaded, a button "Изпрати за приемане сега" calls it –
+   *       the panel's own send function)
    */
   function mount(opts) {
     const L = () => T[opts.lang === "en" ? "en" : "bg"];
+    // round 19 L5: day headings in the shared date format (BG DD.MM.YYYY), not the stored ISO day
+    const dayText = (d, time) => {
+      const g = typeof globalThis !== "undefined" ? globalThis : typeof self !== "undefined" ? self : {};
+      const I = g.ArstenI18n;
+      if (I && typeof I.fmtDate === "function") { const x = I.fmtDate(d, opts.lang === "en" ? "en" : "bg", time ? { time: true } : undefined); if (x) return x; }
+      const m = /^(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d:\d\d))?/.exec(String(d || ""));
+      return m ? `${m[3]}.${m[2]}.${m[1]}${time && m[4] ? " " + m[4] : ""}` : String(d || "");
+    };
     const core = opts.core || coreClient(opts.coreBase, opts.getToken);
-    const st = { records: [], view: "sel", filter: "", queue: [], urls: new Map(), folders: new Map(), loaded: false, open: null, confirm: false, picking: false, picked: new Set() };
+    const st = { records: [], view: "sel", filter: "", queue: sessionQueue(opts.project && opts.project.id), offerSend: false, urls: new Map(), folders: new Map(), loaded: false, open: null, confirm: false, picking: false, picked: new Set() };
     const say = (t, bad) => opts.onStatus && opts.onStatus(t, bad);
     if (!document.getElementById("ph-css")) { const s = document.createElement("style"); s.id = "ph-css"; s.textContent = CSS; document.head.appendChild(s); }
 
@@ -349,8 +644,8 @@
       for (const name of [...ROOT_PATH, day]) {
         const key = parent + "/" + name;
         if (st.folders.has(key)) { parent = st.folders.get(key); continue; }
-        const items = (await core.req(`folders/${encodeURIComponent(parent)}/items`)) || [];
-        let f = (Array.isArray(items) ? items : items.items || []).find((x) => String(x.type).toUpperCase() === "FOLDER" && x.name === name);
+        const items = (await listFolder(core, parent)).items;   // every page (round 17 L4)
+        let f = items.find((x) => String(x.type).toUpperCase() === "FOLDER" && x.name === name);
         if (!f) f = await core.req("folders", "POST", { name, parentId: parent });
         st.folders.set(key, f.id); parent = f.id;
       }
@@ -358,79 +653,59 @@
       return parent;
     }
 
-    async function uploadFile(folderId, name, blob) {
-      const init = await core.req("files/fs/initiate", "POST", { parentId: folderId, parentType: "FOLDER", name });
-      const put = (await send((...a) => fetch(...a), init.uploadURL, { method: "PUT", body: blob, headers: { "Content-Type": "image/jpeg" } },
-        { path: "upload", what: "upload PUT", ms: UPLOAD_TIMEOUT_MS })).res;
-      if (!put.ok) throw new Error(`upload PUT ${put.status}`);
-      const done = await core.req("files/fs/commit", "POST", { uploadId: init.uploadId });
-      let id = done && (done.id || done.fileId || (done.file && done.file.id) || (done.data && done.data.id));
-      for (let i = 0; !id && i < 10; i++) {   // commit can finish asynchronously: look the file up in its folder
-        await new Promise((r) => setTimeout(r, 800));
-        const items = (await core.req(`folders/${encodeURIComponent(folderId)}/items`)) || [];
-        const f = (Array.isArray(items) ? items : items.items || []).find((x) => x.name === name);
-        if (f) id = f.id;
-      }
-      if (!id) throw new Error("upload: file id not returned");
-      return id;
-    }
+    const putBlob = (url, blob) => send((...a) => fetch(...a), url, { method: "PUT", body: blob, headers: { "Content-Type": "image/jpeg" } },
+      { path: "upload", what: "upload PUT", ms: UPLOAD_TIMEOUT_MS }).then((x) => x.res);
+    const uploadWith = (lister) => (folderId, name, blob, track) => uploadFile(core, putBlob, folderId, name, blob, track, { find: lister.find });
 
-    async function nativeLinks(fileId, objs) {
-      const out = [];
-      let models = [];
-      try { models = (await opts.api.viewer.getModels()) || []; } catch {}
-      const byModel = new Map();
-      for (const o of objs) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.guid); }
-      for (const [modelId, guids] of byModel) {
-        const m = models.find((x) => x.id === modelId) || {};
-        const data = guids.map((g) => ({ sourceId: g, type: "BIMOBJECT" }));
-        const target = { id: fileId, type: "FILE" };
-        // Plain model file: source = {file id, version}. With "modelId" Connect answers 400 "Object link modelId is not
-        // enabled" (live 1028, 13.11.2026); the web app adds modelId only for another kind of model, so it is the fallback.
-        let r;
-        try { r = await core.req("objectlink", "POST", { source: { id: modelId, versionId: m.versionId || undefined, data }, target }); }
-        catch (e) { if (e.status !== 400) throw e; r = await core.req("objectlink", "POST", { source: { id: modelId, versionId: m.versionId || undefined, modelId, data }, target }); }
-        const id = r && (r.id || (Array.isArray(r) && r[0] && r[0].id));
-        if (id) out.push(id);
-      }
-      return out;
-    }
+    const nativeLinks = (fileId, objs) => linkObjects(core, async () => (await opts.api.viewer.getModels()) || [], fileId, objs);
 
+    const deps = (lister) => ({ prepare: prepareImage, folderFor, upload: uploadWith(lister), links: nativeLinks,
+      write: (link, rec) => opts.client.write(opts.libId, DEF_ID, link, rec), projectId: opts.project.id, user: opts.user, texts: L(),
+      onProgress: () => render() });
+    /** Upload these queue items one by one; then each purpose's photos go to onUploaded (acceptance) per set of objects. */
+    async function runItems(items) {
+      const byKey = new Map();   // purpose + objects -> {purpose, objects, fileIds}
+      const d = deps(folderLister(core));   // round 17 L4: each day folder is listed once for the whole batch, not per photo
+      for (const q of items) {
+        const linkOnly = q.done;   // a saved photo whose missing native links are made again (L10): not handed over again
+        const rec = await processItem(q, d);
+        if (!rec) continue;
+        const at = st.records.findIndex((r) => r.file_id === rec.file_id);
+        if (at < 0) st.records.push(rec); else if (linkOnly) Object.assign(st.records[at], rec);
+        const p = q.ctx.purpose;
+        if (!p || linkOnly) continue;
+        const k = p + "|" + (q.ctx.objs || []).map((o) => o.guid).sort().join(",");
+        if (!byKey.has(k)) byKey.set(k, { purpose: p, objects: q.ctx.objs, fileIds: [] });
+        byKey.get(k).fileIds.push(rec.file_id);
+      }
+      queuePrune(st.queue);
+      render();
+      const handed = await handOver([...byKey.values()], opts.onUploaded);
+      // A9: photos for acceptance went in -> offer to send the request at once (the panel's own send function).
+      // Round 15, L7: only when attaching them to the request(s) succeeded.
+      if (byKey.size && opts.sendNow && handed) { st.offerSend = true; render(); }
+    }
     async function addFiles(files) {
       const objs = opts.targets();
       if (!objs.length) return say(L().needSel, true);
       const caption = ((opts.el.querySelector(".ph-cap") || {}).value || "").trim();
       const labels = [...new Set(objs.map((o) => o.label).filter(Boolean))];
       const purpose = ((opts.el.querySelector(".ph-purpose") || {}).value || "");
-      const uploaded = [];
-      const list = [...files].filter((f) => /^image\//.test(f.type) || /\.(jpe?g|png|heic|webp)$/i.test(f.name));
-      const mine = list.map((f) => ({ name: f.name, state: L().up + "…", file: f }));
+      const mine = queueItems(files, { objs, caption, labels, purpose }, L().up + "…");
       st.queue.push(...mine);
       st.caption = "";
+      st.offerSend = false;
       render();
-      for (const q of mine) {
-        const file = q.file; q.file = null;
-        try {
-          const img = await prepareImage(file);
-          q.state = `${fmtSize(img.size)} (${L().orig} ${fmtSize(img.originalSize)}) – ${L().up}…`; render();
-          const day = dayOf(img.taken);
-          const name = fileName(img.taken, labels, Math.random().toString(36).slice(2, 6));
-          const folderId = await folderFor(day);
-          const fileId = await uploadFile(folderId, name, img.blob);
-          let links = [], linkErr = "";
-          try { links = await nativeLinks(fileId, objs); } catch (e) { linkErr = e.message; }
-          const rec = { file_id: fileId, file_name: name, day, taken: isoLocal(img.taken), uploaded: isoLocal(new Date()), by: opts.user || "",
-            caption, labels: labels.join(", "), objects: JSON.stringify(objs.map((o) => ({ modelId: o.modelId, guid: o.guid, label: o.label || "" }))),
-            links: links.join(","), size: `${img.w}x${img.h} ${fmtSize(img.size)}`, deleted: false, purpose };
-          const link = photoLink(opts.project.id, fileId);
-          await opts.client.write(opts.libId, DEF_ID, link, rec);
-          st.records.push(Object.assign({ link }, rec));
-          uploaded.push(fileId);
-          q.state = `${L().done}${links.length ? "" : " · " + L().noNative + (linkErr ? ` (${linkErr})` : "")}`;
-        } catch (e) { q.state = `${L().fail}: ${e.message}`; q.bad = true; }
-        render();
-      }
-      if (purpose && uploaded.length && opts.onUploaded) await opts.onUploaded({ purpose, fileIds: uploaded, objects: objs });
+      await runItems(mine);
+    }
+    async function retry(id) {
+      const items = retryable(st.queue).filter((q) => id == null || q.id === id);
+      if (items.length) await runItems(items);
+    }
+    function dropItem(id) {
+      const i = st.queue.findIndex((q) => q.id === id && (q.bad || q.linkMissing) && !q.busy);
+      if (i >= 0) st.queue.splice(i, 1);
+      render();
     }
 
     async function urlOf(r) {
@@ -498,10 +773,10 @@
       if (!st.loaded) body = `<div class="sub">${l.loading}</div>`;
       else if (st.view === "sel") {
         const list = forObjects(st.records, guids);
-        body = !guids.length ? `<div class="sub">${l.needSel}</div>` : list.length ? groupByDay(list).map((g) => `<div class="ph-day">${esc(g.day)}</div>${thumbs(g.items)}`).join("") : `<div class="sub">${l.noneSel}</div>`;
+        body = !guids.length ? `<div class="sub">${l.needSel}</div>` : list.length ? groupByDay(list).map((g) => `<div class="ph-day">${esc(dayText(g.day))}</div>${thumbs(g.items)}`).join("") : `<div class="sub">${l.noneSel}</div>`;
       } else {
         const groups = groupByDay(st.records, st.filter);
-        body = groups.length ? groups.map((g) => `<div class="ph-day">${esc(g.day)} · ${g.items.length}</div>${thumbs(g.items)}`).join("") : `<div class="sub">${l.none}</div>`;
+        body = groups.length ? groups.map((g) => `<div class="ph-day">${esc(dayText(g.day))} · ${g.items.length}</div>${thumbs(g.items)}`).join("") : `<div class="sub">${l.none}</div>`;
       }
       const labels = [...new Set(objs.map((o) => o.label).filter(Boolean))];
       opts.el.innerHTML = `
@@ -511,7 +786,7 @@
           <div class="bar" style="justify-content:center"><input type="text" class="ph-cap" placeholder="${esc(l.caption)}" value="${esc(st.caption || "")}" style="flex:1;min-width:120px">
             <label class="small" style="border:1px solid var(--line,#d9d5cc);padding:2px 7px;cursor:pointer">${l.add}<input type="file" class="ph-file" accept="image/*" multiple hidden></label>
             <label class="small" style="border:1px solid var(--line,#d9d5cc);padding:2px 7px;cursor:pointer">${l.camera}<input type="file" class="ph-cam" accept="image/*" capture="environment" hidden></label></div>
-          ${st.queue.length ? `<div class="ph-q">${st.queue.slice(-6).map((q) => `<div class="${q.bad ? "bad" : "sub"}">${esc(q.name)}: ${esc(q.state)}</div>`).join("")}</div>` : ""}</div>` : ""}
+          ${queueHtml()}</div>` : ""}
         <div class="bar"><button class="small ${st.view === "sel" ? "" : "secondary"}" data-phv="sel">${l.sel}</button><button class="small ${st.view === "all" ? "" : "secondary"}" data-phv="all">${l.all}</button>
           ${st.view === "all" ? `<input type="text" class="ph-filter" placeholder="${esc(l.filter)}" value="${esc(st.filter)}" style="flex:1;min-width:90px">` : ""}
           ${opts.canAdd && (opts.purposes || []).length ? `<button class="small ${st.picking ? "" : "secondary"}" data-phpick="1">${st.picking ? l.pickDone : l.pick}</button>` : ""}</div>
@@ -522,10 +797,18 @@
       opts.el.querySelectorAll("img[data-src]").forEach((img) => { const r = st.records.find((x) => x.file_id === img.dataset.src); if (r) urlOf(r).then((u) => { if (!u) return; img.src = u; const a = img.closest(".ph-box") && opts.el.querySelector(".ph-open"); if (a) { a.href = u; a.style.opacity = ""; a.style.pointerEvents = ""; } }).catch(() => {}); });
       wireZoom(opts.el.querySelector(".ph-view"));
     }
+    function queueHtml() {
+      const l = L(), again = retryable(st.queue);
+      const rows = queueView(st.queue).map((q) => `<div class="${q.bad ? "bad" : "sub"}">${esc(q.name)}: ${esc(q.state)}${canRetry(q)
+        ? ` <button class="small" data-phretry="${q.id}">${l.retry}</button> <button class="small secondary" data-phdrop="${q.id}">${l.drop1}</button>` : ""}</div>`).join("");
+      const many = again.length > 1 ? `<div class="bar" style="justify-content:center"><button class="small" data-phretry="all">${l.retryAll.replace("{n}", again.length)}</button></div>` : "";
+      const offer = st.offerSend && opts.sendNow ? `<div class="bar" style="justify-content:center"><span class="sub">${l.sendAsk}</span><button class="small" data-phsend="1">${l.sendNow}</button><button class="small secondary" data-phsend="0">${l.sendLater}</button></div>` : "";
+      return (rows || many ? `<div class="ph-q">${rows}${many}</div>` : "") + offer;
+    }
     function box(r) {
       const l = L();
       return `<div class="ph-box"><div class="ph-view" title="${esc(L().zoom)}"><img alt="" data-src="${esc(r.file_id)}"></div>
-        <div class="ph-meta"><b>${esc(r.labels)}</b>${r.purpose ? ` · ${esc(((opts.purposes || []).find((p) => p.id === r.purpose) || {})[opts.lang === "en" ? "en" : "bg"] || r.purpose)}` : ""}${r.caption ? " – " + esc(r.caption) : ""}<br>${esc(String(r.taken || "").replace("T", " ").slice(0, 16))} · ${esc(r.by)} · ${esc(r.size)} · ${r.links ? l.native : l.noNative}</div>
+        <div class="ph-meta"><b>${esc(r.labels)}</b>${r.purpose ? ` · ${esc(((opts.purposes || []).find((p) => p.id === r.purpose) || {})[opts.lang === "en" ? "en" : "bg"] || r.purpose)}` : ""}${r.caption ? " – " + esc(r.caption) : ""}<br>${esc(dayText(r.taken, true))} · ${esc(r.by)} · ${esc(r.size)} · ${r.links ? l.native : l.noNative}</div>
         <div class="ph-acts">${st.confirm ? `<span>${l.delAsk}</span><button class="small ph-bad" data-pha="yes">${l.yes}</button><button class="small" data-pha="no">${l.no}</button>`
           : `${canDelete(r) ? `<button class="small ph-bad" data-pha="del">${l.del}</button>` : ""}<span class="ph-r">${opts.canAdd && (opts.purposes || []).length ? markSelect("ph-markone") : ""}<a class="ph-open" target="_blank" rel="noopener" style="opacity:.5;pointer-events:none">${l.openNew}</a><button class="small" data-pha="show">${l.show}</button><button class="small" data-pha="close">${l.close}</button></span>`}</div></div>`;
     }
@@ -543,6 +826,12 @@
         drop.ondragleave = () => drop.classList.remove("on");
         drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("on"); const f = [...(e.dataTransfer.files || [])]; g(() => addFiles(f))(); };
       }
+      el.querySelectorAll("[data-phretry]").forEach((b) => { b.onclick = g(() => retry(b.dataset.phretry === "all" ? null : +b.dataset.phretry)); });
+      el.querySelectorAll("[data-phdrop]").forEach((b) => { b.onclick = () => dropItem(+b.dataset.phdrop); });
+      el.querySelectorAll("[data-phsend]").forEach((b) => { b.onclick = g(async () => {
+        st.offerSend = false; render();
+        if (b.dataset.phsend === "1") await opts.sendNow();
+      }); });
       el.querySelectorAll("[data-phv]").forEach((b) => { b.onclick = () => { st.view = b.dataset.phv; render(); }; });
       const fl = el.querySelector(".ph-filter");
       if (fl) fl.oninput = () => { st.filter = fl.value; const pos = fl.selectionStart; render(); const n = opts.el.querySelector(".ph-filter"); if (n) { n.focus(); n.setSelectionRange(pos, pos); } };
@@ -573,8 +862,8 @@
 
     load().catch((e) => { st.loaded = true; render(); say(e.message, true); });
     render();
-    return { render, reload: load, state: st };
+    return { render, reload: load, state: st, retry };
   }
 
-  return { DEF_ID, wireZoom, existingIds, definition, photoPrefix, photoLink, fileName, exifDate, groupByDay, forObjects, parseObjects, fmtSize, coreClient, TIMEOUT_MS, UPLOAD_TIMEOUT_MS, TIMEOUT_TEXT, prepareImage, mount };
+  return { DEF_ID, sessionQueue, queueItems, retryable, canRetry, handOver, uploadFile, linkObjects, findInFolder, listFolder, folderLister, mapLimit, PAGE_SIZES, queueView, queuePrune, processItem, wireZoom, existingIds, definition, photoPrefix, photoLink, fileName, exifDate, groupByDay, forObjects, parseObjects, fmtSize, coreClient, TIMEOUT_MS, UPLOAD_TIMEOUT_MS, TIMEOUT_TEXT, prepareImage, mount };
 });
