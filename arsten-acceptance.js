@@ -185,14 +185,21 @@
    */
   function pourStates(records, step) {
     const RANK = { rejected: 4, open: 3, remarks: 2, approved: 1 };
-    const rs = records.filter(valid), pours = [...new Set(rs.map((r) => r.pour))], out = [];
-    for (const pour of pours) {
+    // Grouped by pour once (speed audit item 9b: every pour filtered all records again - 20 000 requests took 13 s).
+    // Each group keeps the records in their original order, so latestCovering sees the same list as before.
+    const byPour = new Map(), out = [];
+    for (const r of records) {
+      if (!valid(r)) continue;
+      const l = byPour.get(r.pour);
+      if (l) l.push(r); else byPour.set(r.pour, [r]);
+    }
+    for (const [pour, rs] of byPour) {
       const steps = step === "formwork" || step === "rebar" ? [step] : ["formwork", "rebar"];
       const latestOf = steps.map((s) => latestCovering(rs, pour, s)).filter(Boolean);
       if (!latestOf.length) continue;
       const worst = latestOf.reduce((a, b) => ((RANK[b.status] || 0) > (RANK[a.status] || 0) ? b : a));
       const objs = new Map();
-      for (const r of rs.filter((x) => x.pour === pour)) for (const o of parseObjects(r.objects)) objs.set(o.modelId + ":" + o.guid, { modelId: o.modelId, guid: o.guid });
+      for (const r of rs) for (const o of parseObjects(r.objects)) objs.set(o.modelId + ":" + o.guid, { modelId: o.modelId, guid: o.guid });
       out.push({ pour, status: worst.status, objects: [...objs.values()] });
     }
     return out;

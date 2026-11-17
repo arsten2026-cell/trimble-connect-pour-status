@@ -31,7 +31,113 @@
     const s = new Set(selGuids || []);
     return d.every((g) => s.has(g));
   }
-  const U = { daysBack, dateHint, boxValue, keepDrafts };
+  // ---------- remembered view settings (week 3, A7) ----------
+  /** On/off setting from storage ("1"/"0"); anything else, no storage or a throwing storage (private mode, blocked
+   *  site data) gives the default. */
+  function readPref(store, key, def) {
+    try {
+      const s = typeof store === "function" ? store() : store;
+      const v = s ? s.getItem(key) : null;
+      return v === "1" ? true : v === "0" ? false : def;
+    } catch { return def; }
+  }
+  /** Save an on/off setting; false when it could not be saved (the panel then just keeps it for this session). */
+  function writePref(store, key, on) {
+    try {
+      const s = typeof store === "function" ? store() : store;
+      if (!s) return false;
+      s.setItem(key, on ? "1" : "0");
+      return true;
+    } catch { return false; }
+  }
+  /** Objects by colour for the model: one entry per stage that has objects, so the panel makes one setObjectState
+   *  call per colour, not one per object. stages = PourStatus.STAGES (index 0 = not started). */
+  function colourGroups(objects, stageOf, stages, seeThrough, seeThroughOpacity) {
+    const buckets = stages.map(() => []);
+    for (const o of objects || []) { const k = stages.indexOf(stageOf(o)); buckets[k < 0 ? 0 : k].push(o); }
+    return buckets.map((objs, k) => ({ stage: stages[k], colour: stages[k].colour, opacity: k === 0 && seeThrough ? seeThroughOpacity : 1, objs }))
+      .filter((g) => g.objs.length);
+  }
+
+  // ---------- rebar acceptance before "Излят" (week 3, A3) ----------
+  /** Pours (labels) whose rebar is not accepted, by reason, from ArstenAcceptance.rebarNotApproved.
+   *  Acc = the ArstenAcceptance module (none: no check, null); acc = its records, or null when they did not load
+   *  (unknown: the user must confirm too). Returns null when nothing needs a warning. */
+  function rebarCheck(Acc, acc, pours) {
+    if (!Acc) return null;
+    const list = [...new Set((pours || []).filter(Boolean))];
+    if (!list.length) return null;
+    if (!acc) return { unknown: true, open: [], rejected: [], none: [], pours: list };
+    const out = { unknown: false, open: [], rejected: [], none: [], pours: [] };
+    for (const p of Acc.rebarNotApproved(acc, list)) {
+      const r = Acc.latestCovering(acc, p, "rebar");
+      out[!r ? "none" : r.status === "rejected" ? "rejected" : "open"].push(p);
+      out.pours.push(p);
+    }
+    return out.pours.length ? out : null;
+  }
+  /** One line for the "Излят" card: "Армировка: чака приемане за TAKT 3, TAKT 4 · отхвърлена за TAKT 5". */
+  function rebarWarnText(chk, lang) {
+    if (!chk) return "";
+    const bg = lang !== "en";
+    if (chk.unknown) return bg ? `Армировка: приемането не е заредено – проверете за ${chk.pours.join(", ")}` : `Rebar: acceptance not loaded – check ${chk.pours.join(", ")}`;
+    const parts = [];
+    if (chk.open.length) parts.push((bg ? "чака приемане за " : "awaiting acceptance for ") + chk.open.join(", "));
+    if (chk.rejected.length) parts.push((bg ? "отхвърлена за " : "rejected for ") + chk.rejected.join(", "));
+    if (chk.none.length) parts.push((bg ? "няма заявка за приемане за " : "no acceptance request for ") + chk.none.join(", "));
+    return (bg ? "Армировка: " : "Rebar: ") + parts.join(" · ");
+  }
+
+  // ---------- search in the pours list (week 3, A5) ----------
+  /** Does a pour label match the search? Terms are separated by "," or ";" (or spaces between plain numbers):
+   *  a number = a whole number in the label ("12" finds "TAKT 12", not "TAKT 120"); a term with a number = that pour
+   *  ("takt 5" = "TAKT 05"); other text = contained in the label. Empty search: everything. */
+  function matchPour(label, query) {
+    const norm = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().toUpperCase();
+    const keyOf = (s) => { const m = /^(.*?)(\d+)$/.exec(norm(s)); return m ? (m[1].trim() + " " + parseInt(m[2], 10)).trim() : null; };
+    const terms = [];
+    for (const chunk of String(query == null ? "" : query).split(/[,;]+/)) {
+      const c = chunk.trim();
+      if (!c) continue;
+      if (/^[\d\s]+$/.test(c)) terms.push(...c.split(/\s+/).filter(Boolean)); else terms.push(c);
+    }
+    if (!terms.length) return true;
+    const L = norm(label), nums = (L.match(/\d+/g) || []).map((x) => parseInt(x, 10)), key = keyOf(L);
+    return terms.some((t) => {
+      if (/^\d+$/.test(t)) return nums.includes(parseInt(t, 10));
+      const k = keyOf(t);
+      if (k && /\d$/.test(norm(t))) return key === k;
+      return L.includes(norm(t));
+    });
+  }
+
+  // ---------- "Статус без обект" with one stage loaded (speed audit item 3) ----------
+  /** Orphans (PourStatus.orphans) split into the rows to list and the rest. Listed: records that can be re-attached,
+   *  i.e. their pour (or their match key) exists in the loaded models. Records of pours that are not loaded - another
+   *  stage, or a pour deleted from the model - have nothing to re-attach to and are only counted (thousands of rows with
+   *  one stage of a big project loaded). */
+  function orphanRows(orph) {
+    const shown = [], hidden = [];
+    for (const x of orph || []) (x.candidates && x.candidates.length ? shown : hidden).push(x);
+    return { shown, hidden };
+  }
+
+  // ---------- the loaded model set (review round 12, M6 / audit item 8) ----------
+  /** Key of the loaded models: every model as "id@versionId", sorted, from getModels("loaded"). null when it cannot be
+   *  compared safely: nothing loaded, not a list, or any model without an id or a versionId (then the panel reloads). */
+  function modelSetKey(specs) {
+    if (!Array.isArray(specs) || !specs.length) return null;
+    const out = new Set();
+    for (const m of specs) {
+      if (!m || m.id == null || m.id === "" || m.versionId == null || m.versionId === "") return null;
+      out.add(String(m.id) + "@" + String(m.versionId));
+    }
+    return [...out].sort().join("|");
+  }
+  /** The loaded models are the same as at the last finished load: both keys known and equal. */
+  const sameModelSet = (a, b) => a != null && b != null && a === b;
+
+  const U = { daysBack, dateHint, boxValue, keepDrafts, readPref, writePref, colourGroups, rebarCheck, rebarWarnText, matchPour, orphanRows, modelSetKey, sameModelSet };
   if (typeof module === "object" && module.exports) module.exports = U; else g.PourUi = U;
 })(typeof window !== "undefined" ? window : globalThis);
 
@@ -55,22 +161,31 @@
       "The step does not apply to this object (no formwork / no rebar). Counts as covered, no quantity to invoice."], noteOnly: ["Само бележка", "Note only"],
     noteOnlyTip: ["Записва само бележката (датата и кой остават)", "Saves only the note (date and who stay)"],
     done: ["готови", "done"], select: ["Избери", "Select"], pour: ["Такт", "Pour"],
+    colourHint: ["Цветовете показват етапа на всеки такт в модела.", "The colours show each pour's stage in the model."],
+    search: ["Търси такт (номер или име)", "Find a pour (number or name)"], selectMatches: ["Избери в модела", "Select in the model"],
+    pourConfirm: ["Потвърди – излей", "Confirm – poured"], noMatch: ["Няма такт с това търсене.", "No pour matches the search."],
   };
   let lang = (() => { try { return localStorage.getItem("arsten.pourStatus.lang") || "bg"; } catch { return "bg"; } })();
   const t = (k) => (T[k] ? T[k][lang === "bg" ? 0 : 1] : k);
   const L2 = (b, e) => (lang === "bg" ? b : e);
   const stepName = (s) => (lang === "bg" ? s.bg : s.en);
 
+  // Remembered per user (browser) settings (week 3, A7). Every storage access is wrapped (U.readPref / U.writePref).
+  const store = () => { try { return window.localStorage; } catch { return null; } };
+  const PREF = { follow: "arsten.pourStatus.follow", coloured: "arsten.pourStatus.coloured", seeThrough: "arsten.pourStatus.seeThrough", rebarHidden: "arsten.pourStatus.hideRebar" };
   const state = {
     api: null, client: null, project: null, user: "",
     lib: null, defId: S.DEF_ID, ready: false,
-    follow: (() => { try { return localStorage.getItem("arsten.pourStatus.follow") !== "0"; } catch { return true; } })(),   // follow model selection (default on)
+    follow: U.readPref(store, PREF.follow, true),   // follow model selection (default on)
     pours: [], loose: [], objects: [],      // pour groups; all pour objects [{modelId,id,guid,key,props,bbox,group}]
     byKey: new Map(),                        // "modelId:id" -> pour object
     records: new Map(),                      // guid -> status props
     sel: [],                                 // selected pour objects
-    coloured: false,
-    seeThrough: (() => { try { return localStorage.getItem("arsten.pourStatus.seeThrough") !== "0"; } catch { return true; } })(),   // not started = see-through (default on)
+    coloured: U.readPref(store, PREF.coloured, true),        // "Оцвети по статус": on by default, remembered (A7, owner 17.11)
+    rebarHidden: U.readPref(store, PREF.rebarHidden, false),
+    seeThrough: U.readPref(store, PREF.seeThrough, true),    // not started = see-through (default on)
+    filter: "",                              // search in the pours list (A5)
+    armPour: null,                           // selection key armed by the first tap on "Излят" without accepted rebar (A3)
     drafts: {},                              // stepId -> {date?, note?} typed but not saved yet (survives re-renders; week 1, F6)
     draftSel: [],                            // GUIDs of the selection the drafts were typed for (M2)
     confirmOrphan: null,                     // guid of the orphan whose inline "Прехвърли" confirm box is open (week 1, F7)
@@ -78,6 +193,17 @@
     backupAsk: null,                         // {act, into?, text}: a destructive action waiting for "Продължи без архив" (M5)
   };
   const objKey = (o) => o.modelId + ":" + o.id;
+  /** Office content (legacy "Премести" banner, load diagnostics, raw GUIDs, hidden-record counts) for the office side,
+   *  site roles see the work (A8). Same rule as Стомана (round 11, M5): admin, the PM (the "stages" cap), designers. */
+  const office = () => ArstenAccess.side(state.access) === "office";
+  /** May save statuses, notes, photos and acceptance requests (round 11, M3): pset-api lets only the groups with Edit
+   *  write (00_ADMIN, 02, 02.1). A Connect project ADMIN outside them gets the panel read-only, with one line why. */
+  const canWrite = () => ArstenAccess.canWrite(state.access);
+  const readOnlyText = () => (ArstenAccess.hasRole(state.access, "admin")
+    ? L2("Само преглед: добавете се в 00_ADMIN, за да записвате.", "Read only: add yourself to 00_ADMIN to save.")
+    : L2("Само преглед: нямате права за запис.", "Read only: you have no rights to save."));
+  const noWriteText = () => L2("Нямате права да записвате в библиотеката " + S.LIB_NAME + ".", "You have no permission to write to the library " + S.LIB_NAME + ".");
+  const selKey = (objs) => objs.map((o) => o.guid).sort().join("|");
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   function setStatus(text, bad) { $("status").textContent = text; $("status").className = "status" + (bad ? " bad" : ""); }
   // Result of a write, shown at the bottom of the panel near the finger (week 1, A2); the status line stays as well.
@@ -92,12 +218,16 @@
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { el.className = "toast"; el.textContent = ""; }, bad ? 8000 : 4000);
   }
+  // Bumped on every change of state.records (loadRecords, putRec): splits / merges / orphans are computed once per
+  // change, not on every selection click (speed audit item 3; see derived()).
+  let recVer = 0, derivedMemo = null;
   // Writes in flight: a model reload waits for them, so a reload's older read can't replace a fresh write (M4).
   let inflight = 0;
   async function writing(fn) { inflight++; try { return await fn(); } finally { inflight--; } }
   const reloadBusy = () => reloading || reloadTimer != null;
   function report(text, bad) { setStatus(text, bad); toast(text, bad); }
-  const errText = (e) => (e && (e.message || e.toString())) || String(e);
+  // a server refusal (403) always reads as "no rights", whichever write it was (round 11, M3)
+  const errText = (e) => (e && e.status === 403 ? noWriteText() : (e && (e.message || e.toString())) || String(e));
   async function guarded(fn) { try { await fn(); } catch (e) { const m = L2("Грешка: ", "Error: ") + errText(e); setStatus(m, true); toast(m, true); console.error(e); } }
   async function pool(items, n, fn) {
     let next = 0;
@@ -107,13 +237,27 @@
   // ---------- access token (extension permission) ----------
   let tokenWaiters = [], token = null;
   function onToken(tk) { token = tk; const w = tokenWaiters; tokenWaiters = []; w.forEach((f) => f(tk)); }
+  // The waiter is registered before asking (the token event may come while requestPermission runs). When Connect
+  // returns the token directly, or refuses, the waiter and its 60 s timer are dropped, so no unobserved promise is
+  // rejected a minute later (review round 12, L6).
   async function getToken(refresh) {
     if (token && !refresh) return token;
-    const p = new Promise((resolve, reject) => { tokenWaiters.push(resolve); setTimeout(() => reject(new Error("No access token from Trimble Connect")), 60000); });
-    const r = await state.api.extension.requestPermission("accesstoken");
-    if (r === "denied") throw new Error("Access to Trimble Connect data was denied for this extension.");
-    if (r && r !== "pending" && r !== "granted") { token = r; return r; }
+    let timer = 0, done = null;
+    const p = new Promise((resolve, reject) => {
+      done = (tk) => { clearTimeout(timer); resolve(tk); };
+      tokenWaiters.push(done);
+      timer = setTimeout(() => { tokenWaiters = tokenWaiters.filter((f) => f !== done); reject(new Error("No access token from Trimble Connect")); }, 60000);
+    });
+    const drop = () => { clearTimeout(timer); tokenWaiters = tokenWaiters.filter((f) => f !== done); p.catch(() => {}); };
+    let r;
+    try { r = await state.api.extension.requestPermission("accesstoken"); } catch (e) { drop(); throw e; }
+    if (r === "denied") { drop(); throw new Error("Access to Trimble Connect data was denied for this extension."); }
+    if (r && r !== "pending" && r !== "granted") { drop(); token = r; return r; }
     return p;
+  }
+  /** getModels("loaded"); [] when the call fails (the model set then counts as changed). */
+  async function loadedModels() {
+    try { return (await state.api.viewer.getModels("loaded")) || []; } catch { return []; }
   }
 
   // ---------- reading pour objects (same rules as Pour tags) ----------
@@ -190,7 +334,7 @@
   }
   function showSetup(html) {
     $("setupBox").innerHTML = html; $("setupBox").hidden = false; $("mainBox").hidden = true;
-    const b = $("btnRecheck"); if (b) b.onclick = () => guarded(start2);
+    const b = $("btnRecheck"); if (b) b.onclick = () => loadGuarded();
   }
   async function loadRecords() {
     // All records of the definition, including objects no longer in the model (needed for merges, splits where the
@@ -200,24 +344,29 @@
     const links = state.objects.map((o) => S.entityLink(o.guid));
     const legacy = state.objects.filter((o) => LK.hasLegacy(o.guid)).map((o) => LK.legacyLink(o.guid));
     // Always also read the objects in the model directly, so a list call that fails or returns less loses nothing.
-    const enc = await state.client.readMany(state.lib.id, state.defId, links);
-    const raw = legacy.length ? await state.client.readMany(state.lib.id, state.defId, legacy) : new Map();
+    // The three reads are independent: run them at the same time (speed audit item 7). A failed direct read fails the
+    // load as before; a failed list falls back to the objects in the model as before.
+    const listing = state.client.listAll(state.lib.id, state.defId, "frn:entity:").then((all) => ({ all }), (error) => ({ error }));
+    const [enc, raw, lst] = await Promise.all([
+      state.client.readMany(state.lib.id, state.defId, links),
+      legacy.length ? state.client.readMany(state.lib.id, state.defId, legacy) : new Map(),
+      listing,
+    ]);
     let listed = [];
-    try {
-      const all = await state.client.listAll(state.lib.id, state.defId, "frn:entity:");
-      listed = [...all];
+    if (lst.all) {
+      listed = [...lst.all];
       state.listMode = "all";
-      state.listCount = all.size;
-    } catch (e) {
-      console.warn("Listing all statuses failed, reading only objects in the model:", e);
+      state.listCount = lst.all.size;
+    } else {
+      console.warn("Listing all statuses failed, reading only objects in the model:", lst.error);
       state.listMode = "model";
     }
     // "$" GUIDs listed but not in the model: read both link forms directly, never trust the form the list returned (M3).
     const known = new Set(state.objects.map((o) => o.guid));
     const extra = LK.listedToRead(listed, known);
     if (extra.length) {
-      const e2 = await state.client.readMany(state.lib.id, state.defId, extra.map(LK.entLink));
-      const r2 = await state.client.readMany(state.lib.id, state.defId, extra.map(LK.legacyLink));
+      const [e2, r2] = await Promise.all([state.client.readMany(state.lib.id, state.defId, extra.map(LK.entLink)),
+        state.client.readMany(state.lib.id, state.defId, extra.map(LK.legacyLink))]);
       for (const x of e2) enc.set(x[0], x[1]);
       for (const x of r2) raw.set(x[0], x[1]);
       extra.forEach((g) => known.add(g));
@@ -225,6 +374,7 @@
     const r = LK.collect({ enc, raw, listed, known });
     state.records = r.records;
     state.legacy = r.legacy;
+    recVer++;
   }
   /** Write one object's record under its encoded link (replace: delete + re-create, so fields can be cleared) and
    *  drop its raw-"$" copy, by the shared rule LK.putRecord: a partial write on "move"/"merge" starts from the shown
@@ -237,6 +387,7 @@
       write: (l, p) => c.write(lib, def, l, p), replace: (l, p) => c.replace(lib, def, l, p), remove: (l) => c.remove(lib, def, l),
     }, guid, props, { replace, kind: lg ? lg.kind : null, shown: state.records.get(guid) });
     state.records.set(guid, r.body);
+    recVer++;
     if (r.dropped) state.legacy = state.legacy.filter((x) => x.guid !== guid);
     return r.body;
   }
@@ -310,7 +461,7 @@
           await state.client.remove(state.lib.id, state.defId, LK.legacyLink(x.guid));
         }
         done++;
-      } catch (e) { failed++; if (!first) first = e.status === 403 ? L2("Нямате права да записвате в библиотеката " + S.LIB_NAME + ".", "You have no permission to write to the library " + S.LIB_NAME + ".") : errText(e); }
+      } catch (e) { failed++; if (!first) first = errText(e); }
       setStatus(`${L2("Преместване", "Moving")}: ${done + failed}/${list.length}…`);
     });
     await loadRecords();
@@ -322,10 +473,10 @@
   }
   function legacyBanner() {
     const n = state.legacy.length;
-    if (!n) return "";
+    if (!n || !office()) return "";   // an admin migration task: site roles never see it (A8)
     return `<div class="warn">${esc(L2(`${n} записа (тактове с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`,
       `${n} records (pour objects with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
-      <div class="bar"><button class="small" data-act="moveLegacy">${esc(L2(`Премести (${n})`, `Move (${n})`))}</button></div></div>`;
+      <div class="bar"><button class="small" data-act="moveLegacy"${canWrite() ? "" : " disabled"}>${esc(L2(`Премести (${n})`, `Move (${n})`))}</button>${canWrite() ? "" : `<span class="sub">${esc(readOnlyText())}</span>`}</div></div>`;
   }
 
   // ---------- selection ----------
@@ -349,6 +500,7 @@
   /** Every selection change goes through here: drafts stay only for a superset of the selection they were typed for (M2). */
   function setSel(objs) {
     state.sel = objs.slice();
+    if (state.armPour && state.armPour !== selKey(state.sel)) state.armPour = null;   // a confirm is for one selection only (A3)
     if (reloadTimer != null && !reloading) pendingKeep = state.sel.map((o) => o.guid);   // a reload is waiting: restore this one
     if (Object.keys(state.drafts).length && !U.keepDrafts(state.draftSel, state.sel.map((o) => o.guid))) { state.drafts = {}; state.draftSel = []; }
   }
@@ -394,6 +546,16 @@
     const targets = mode === "mark" || mode === "na" ? (partly ? objs.filter((o) => !has(o)) : objs) : objs.filter(has);
     if (!targets.length) return report(lang === "bg" ? "Няма обекти с този етап." : "No objects with this step.", true);
     if (mode === "note" && keepNote) return report(lang === "bg" ? "Напишете бележка." : "Type a note.", true);
+    // "Излят" over pours whose rebar is not accepted: the first tap only arms the button ("Потвърди – излей"), the
+    // second writes (A3; no window.confirm, Connect's frame can block it). Site reality wins, but the choice is conscious.
+    const rebar = stepId === "poured" && mode === "mark" ? U.rebarCheck(window.ArstenAcceptance, state.acc, targets.filter((o) => !has(o)).map(accPour)) : null;
+    if (rebar && state.armPour !== selKey(objs)) {
+      state.armPour = selKey(objs);
+      render();
+      return report(U.rebarWarnText(rebar, lang) + L2(" – натиснете „Потвърди – излей“, за да запишете.", " – press \"Confirm – poured\" to save."), true);
+    }
+    const confirmed = !!rebar;
+    state.armPour = null;
     const bak = targets.length > BIG ? await backupFirst(`${stepId}-${mode}`, linksOf(targets.map((o) => o.guid))) : "";
     let done = 0, failed = 0, firstErr = "";
     setStatus(`${stepName(step)}: 0/${targets.length}…`);
@@ -411,7 +573,7 @@
         done++;
       } catch (e) {
         failed++;
-        if (e.status === 403) throw new Error(lang === "bg" ? "Нямате права да записвате в библиотеката " + S.LIB_NAME + "." : "You have no permission to write to the library " + S.LIB_NAME + ".");
+        if (e.status === 403) throw new Error(noWriteText());
         console.error(e);
         if (!firstErr) firstErr = e.message || String(e);
       }
@@ -424,7 +586,7 @@
       if (not.length) warn = " · " + L2(`Внимание: армировката не е приета за ${not.join(", ")}`, `Warning: rebar not accepted for ${not.join(", ")}`);
     }
     if (done && !failed) delete state.drafts[stepId];   // saved: the boxes show the saved values again
-    report(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn + bak, failed > 0 || !!warn);
+    report(`${stepName(step)} ${verb}: ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn + bak, failed > 0 || (!!warn && !confirmed));
     render();
     if (state.coloured) await applyColours();
   }
@@ -462,7 +624,8 @@
     const opts = {
       el: $("photosBox"), api: state.api, getToken, project: state.project, user: state.user, client, libId: state.lib.id,
       coreBase: ArstenAccess.coreBase(state.project.location), core,
-      canAdd: true, canDeleteAny: !!(state.access && state.access.role === "admin"), lang,
+      // read-only admins (M3): no upload, no delete; admins with write access may delete anyone's photo
+      canAdd: canWrite(), canDeleteAny: canWrite() && ArstenAccess.hasRole(state.access, "admin"), lang,
       targets: () => state.sel.filter((o) => o.guid).map((o) => ({ modelId: o.modelId, id: o.id, guid: o.guid, label: accPour(o) })),
       onStatus: (text, bad) => { setStatus(text, bad); if (bad) toast(text, true); },
       purposes: window.ArstenAcceptance ? [{ id: "formwork", bg: "За приемане – Кофраж", en: "For acceptance – Formwork" }, { id: "rebar", bg: "За приемане – Армировка", en: "For acceptance – Rebar" }, { id: "both", bg: "За приемане – Кофраж и армировка", en: "For acceptance – Formwork and rebar" }] : [],
@@ -487,9 +650,11 @@
    *  change(fresh | null) returns the full record to save, or null to leave it. Returns the saved record or null. */
   async function saveAcc(link, change) {
     const A = ArstenAcceptance, lib = state.lib.id;
-    const got = await state.client.readMany(lib, A.DEF_ID, [link]);
-    let dec = new Map();
-    try { dec = await state.client.readMany(lib, A.DEC_ID, [link]); } catch (e) { if (e.status !== 404) throw e; }
+    // the request and its decision read at the same time (review round 12, L8); no decision definition yet (404) = none
+    const [got, dec] = await Promise.all([
+      state.client.readMany(lib, A.DEF_ID, [link]),
+      state.client.readMany(lib, A.DEC_ID, [link]).catch((e) => { if (e.status !== 404) throw e; return new Map(); }),
+    ]);
     const fresh = got.has(link) ? A.merge([Object.assign({ link }, got.get(link))], dec)[0] : null;
     const next = change(fresh);
     if (!next) return null;
@@ -511,6 +676,7 @@
     render();
   }
   async function sendAcceptance() {
+    if (!canWrite()) return report(readOnlyText(), true);   // round 11, M3
     if (accBusy) return;
     accBusy = true;
     try { await sendAcceptanceNow(); } finally { accBusy = false; render(); }
@@ -526,7 +692,9 @@
     const body = ArstenAcceptance.todoBody(list, { projectId: state.project.id, groupId: g.id, lang });
     const todo = await core.req("todos", "POST", body);
     const todoId = (todo && (todo.id || todo.todoId)) || "";
-    for (const r of list) await saveAcc(r.link, (fresh) => (fresh && fresh.status === "open" && !fresh.sent ? ArstenAcceptance.markSent(fresh, todoId, state.user) : null));
+    // 4 requests at a time (review round 12, L8: 20 requests were ~12 s); each still re-reads its own fresh copy, and
+    // the first failure stops the rest as the loop did
+    await A.mapLimit(list, 4, (r) => saveAcc(r.link, (fresh) => (fresh && fresh.status === "open" && !fresh.sent ? ArstenAcceptance.markSent(fresh, todoId, state.user) : null)));
     report(L2(`Изпратено за приемане: ${list.length} (една задача в Connect)`, `Sent for acceptance: ${list.length} (one Connect ToDo)`));
     render();
   }
@@ -544,7 +712,7 @@
       return `<div class="sub"><span class="sw" style="background:${s.colour}"></span>${esc(pour)} · ${esc(A.STEPS[step][lang])}: <b>${esc(s[lang])}</b>${r.status === "open" && !r.sent ? L2(" (неизпратена)", " (not sent)") : ""}${r.decided_by ? ` – ${esc(r.decided_by)} ${esc(r.decided)}` : ""}${r.comment ? `<br>„${esc(r.comment)}“` : ""}</div>`;
     };
     box.innerHTML = pours.map((p) => row(p, "formwork") + row(p, "rebar") + row(p, "both")).join("")
-      + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc"${accBusy ? " disabled" : ""}>${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
+      + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc"${accBusy || !canWrite() ? " disabled" : ""}>${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
     const b = $("btnSendAcc");
     if (b) b.onclick = () => guarded(() => writing(sendAcceptance));
   }
@@ -554,21 +722,34 @@
   const REBAR_CLASSES = ["IfcReinforcingBar", "IfcReinforcingMesh", "IfcTendon"];
   // Not via Connect's native class filter: live it returned nothing for these classes (1028 exports, 2026-11-13), so the
   // tick box did nothing. Read every object's class instead; done once per loaded model set (reset on model change).
+  // A model whose version and object count are the same as when its rebar was found is not read again after a reload
+  // (review round 12, L8 / audit item 14: a 10k-bar model was ~7-8 s per reload). No version known: read as before.
+  const rebarCache = new Map();   // modelId -> {ver, n: objects in the model, ids: rebar runtime ids}
   async function rebarIds() {
     if (state.rebarIds) return state.rebarIds;
-    const api = state.api, byModel = new Map();
-    const add = (modelId, ids) => { if (!byModel.has(modelId)) byModel.set(modelId, []); byModel.get(modelId).push(...ids); };
-    {
-      const re = new RegExp(`^(${REBAR_CLASSES.join("|")})$`, "i");
-      for (const m of (await api.viewer.getObjects()) || []) {
-        const ids = (m.objects || []).map((o) => o.id);
+    const api = state.api, byModel = new Map(), next = new Map();
+    const versions = new Map();
+    for (const m of await loadedModels()) if (m && m.versionId) { if (m.id != null) versions.set(m.id, m.versionId); versions.set(m.versionId, m.versionId); }
+    const re = new RegExp(`^(${REBAR_CLASSES.join("|")})$`, "i");
+    for (const m of (await api.viewer.getObjects()) || []) {
+      const ids = (m.objects || []).map((o) => o.id), ver = versions.get(m.modelId);
+      const c = ver ? rebarCache.get(m.modelId) : null;
+      let found;
+      if (c && c.ver === ver && c.n === ids.length) found = c.ids;
+      else {
+        found = [];
         for (let i = 0; i < ids.length; i += BATCH) {
           setStatus(L2(`Търся армировката… ${i} от ${ids.length}`, `Finding rebar… ${i} of ${ids.length}`));
           const props = (await api.viewer.getObjectProperties(m.modelId, ids.slice(i, i + BATCH))) || [];
-          add(m.modelId, props.filter((p) => re.test(String(p.class || ""))).map((p) => p.id));
+          found.push(...props.filter((p) => re.test(String(p.class || ""))).map((p) => p.id));
         }
       }
+      if (ver) next.set(m.modelId, { ver, n: ids.length, ids: found });
+      if (!byModel.has(m.modelId)) byModel.set(m.modelId, []);
+      byModel.get(m.modelId).push(...found);
     }
+    rebarCache.clear();
+    for (const [k, v] of next) rebarCache.set(k, v);   // only the models loaded now
     state.rebarIds = [...byModel].filter(([, ids]) => ids.length).map(([modelId, ids]) => ({ modelId, objectRuntimeIds: [...new Set(ids)] }));
     return state.rebarIds;
   }
@@ -581,23 +762,38 @@
 
   // ---------- colours ----------
   const STAGES = S.STAGES;   // not started, formwork, rebar first (formwork pending), rebar, poured, stripped
-  const NOT_STARTED_OPACITY = 0.15;
-  async function applyColours() {
+  const NOT_STARTED_OPACITY = S.SEE_THROUGH != null ? S.SEE_THROUGH : 0.3;   // status.js (master) since week 3
+  const selector = (objs) => {
+    const byModel = new Map();
+    for (const o of objs) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
+    return { modelObjectIds: [...byModel].map(([modelId, objectRuntimeIds]) => ({ modelId, objectRuntimeIds })) };
+  };
+  // One run at a time; a call during a run repaints once more afterwards (records or the selection changed meanwhile).
+  let colourRun = null, colourAgain = false;
+  function applyColours() {
+    if (colourRun) { colourAgain = true; return colourRun; }
+    colourRun = (async () => {
+      try { do { colourAgain = false; await paintColours(); } while (colourAgain); } finally { colourRun = null; }
+    })();
+    return colourRun;
+  }
+  async function paintColours() {
     const api = state.api;
-    const sel = (objs) => {
-      const byModel = new Map();
-      for (const o of objs) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
-      return { modelObjectIds: [...byModel].map(([modelId, objectRuntimeIds]) => ({ modelId, objectRuntimeIds })) };
-    };
-    if (!state.objects.length) return;
-    if (!state.coloured) return api.viewer.setObjectState(sel(state.objects), { color: "reset", opacity: 1 });
-    const buckets = STAGES.map(() => []);
-    for (const o of state.objects) buckets[STAGES.indexOf(S.stageOf(state.records.get(o.guid)))].push(o);
-    // Not started: see-through grey, so what is underneath stays visible. Started: solid stage colour.
-    // Opacity is 0..1 in Connect (verified in Pour tags).
-    for (let k = 0; k < STAGES.length; k++) {
-      if (buckets[k].length) await api.viewer.setObjectState(sel(buckets[k]), { color: STAGES[k].colour, opacity: k === 0 && state.seeThrough ? NOT_STARTED_OPACITY : 1 });
+    if (!api || !state.objects.length) return;
+    if (!state.coloured) return api.viewer.setObjectState(selector(state.objects), { color: "reset", opacity: 1 });
+    // One setObjectState call per colour group (A7). Not started: see-through slate, so what is underneath stays
+    // visible; started stages: solid colour, full opacity. Opacity is 0..1 in Connect (verified in Pour tags).
+    for (const g of U.colourGroups(state.objects, (o) => S.stageOf(state.records.get(o.guid)), STAGES, state.seeThrough, NOT_STARTED_OPACITY)) {
+      await api.viewer.setObjectState(selector(g.objs), { color: g.colour, opacity: g.opacity });
     }
+  }
+  // Selection changed in the model: Connect can drop object colours (e.g. after isolate / show all), so paint again,
+  // debounced (one paint after a burst of selection events).
+  let colourTimer = null;
+  function colourSoon() {
+    if (!state.coloured || !state.ready) return;
+    clearTimeout(colourTimer);
+    colourTimer = setTimeout(() => guarded(applyColours), 400);
   }
 
   // ---------- Excel export (for invoicing) ----------
@@ -647,7 +843,7 @@
     const font = { name: "Ubuntu", size: 10 };
     const project = (state.project && state.project.name) || "";
     const wb = new ExcelJS.Workbook();
-    wb.creator = "Arsten Pour status"; wb.created = new Date();
+    wb.creator = "Arsten / Multiplan – Pour status"; wb.created = new Date();
     wb.calcProperties.fullCalcOnLoad = true;
 
     function addSheet(name, note, cols, rows, freezeCols) {
@@ -761,9 +957,13 @@
     if (state.photos) { state.photos.lang = lang; state.photos.ui.render(); }
     renderAcceptance();
     $("lblFollow").textContent = t("follow"); $("chkFollow").checked = state.follow; $("btnFromViewer").hidden = state.follow;
-    $("lblColour").textContent = t("colour");
+    $("lblColour").textContent = t("colour"); $("chkColour").checked = !!state.coloured;
+    $("colourHint").textContent = t("colourHint");
+    $("viewBox").classList.toggle("on", !!state.coloured);
     $("lblHideRebar").textContent = t("hideRebar"); $("chkHideRebar").checked = !!state.rebarHidden;
     $("lblSeeThrough").textContent = t("seeThrough"); $("chkSeeThrough").checked = state.seeThrough;
+    $("pourSearch").placeholder = t("search"); $("pourSearch").setAttribute("aria-label", t("search"));
+    $("btnPickMatches").textContent = t("selectMatches");
     if (!state.ready) return;
     $("legacyBox").innerHTML = backupAskBox() + legacyBanner();   // "Продължи без архив" (M5); raw-"$" records waiting for "Премести" (F4)
     // selection
@@ -781,7 +981,8 @@
     const act = document.activeElement;
     const focus = act && /^(date|note)_/.test(act.id || "") && $("steps").contains(act)
       ? { id: act.id, start: act.type === "text" ? act.selectionStart : null, end: act.type === "text" ? act.selectionEnd : null } : null;
-    $("steps").innerHTML = S.STEPS.map((s, i) => {
+    const w = canWrite();
+    $("steps").innerHTML = (w ? "" : `<div class="sub bad" role="note">${esc(readOnlyText())}</div>`) + S.STEPS.map((s, i) => {
       const st = S.stepState(state.records, guids, s.id);
       const v = S.stepValues(state.records, guids, s.id);
       const label = (!sel.length ? "" : st.state === "all" ? `✓ ${st.done}/${st.total}` : st.state === "mixed" ? `${st.done}/${st.total} ${t("done")}` : `0/${st.total}`)
@@ -795,15 +996,20 @@
       // typed but not saved yet wins over the prefill (F6)
       const dr = state.drafts[s.id] || {};
       const dateShown = U.boxValue(dateVal, dr.date), noteShown = U.boxValue(v.note || "", dr.note);
+      // "Излят": rebar acceptance of the pours this button would mark, shown BEFORE writing (A3)
+      const rb = s.id === "poured" && sel.length ? U.rebarCheck(window.ArstenAcceptance, state.acc, sel.filter((o) => !(state.records.get(o.guid) || {}).poured).map(accPour)) : null;
+      const armed = !!rb && state.armPour === selKey(sel);
+      const markLabel = armed ? t("pourConfirm") : partly ? `${t("markDone")} (${st.total - st.done})` : st.done ? t("save") : t("markDone");
       return `<div class="step" style="--c:${s.colour}">
         <div class="hd"><span class="nm">${i + 1}. ${esc(stepName(s))}</span><span class="st ${st.state}">${label}</span></div>
         ${st.dates.length ? `<div class="dates">${esc(st.dates.join(", "))}</div>` : ""}
         <div class="row"><input type="date" id="date_${s.id}" max="${today}" value="${esc(dateShown)}" title="${v.mixedDate ? esc(L2("различни дати – празно = без промяна", "different dates – empty = keep")) : ""}"><input type="text" id="note_${s.id}" data-mixed="${v.mixedNote ? 1 : 0}" value="${esc(noteShown)}" placeholder="${esc(notePh)}"></div>
         <div class="hint" id="hint_${s.id}">${dr.date != null ? esc(U.dateHint(dr.date, today, lang)) : ""}</div>
-        <div class="row"><button class="small" data-act="mark" data-step="${s.id}" ${sel.length ? "" : "disabled"}>${esc(partly ? `${t("markDone")} (${st.total - st.done})` : st.done ? t("save") : t("markDone"))}</button><button
-          class="small secondary" data-act="na" data-step="${s.id}" ${sel.length ? "" : "disabled"} title="${esc(t("withoutTip"))}" ${s.na ? "" : "hidden"}>${esc(t("without"))}</button><button
-          class="small secondary" data-act="note" data-step="${s.id}" ${st.done ? "" : "disabled"} title="${esc(t("noteOnlyTip"))}">${esc(t("noteOnly"))}</button><button
-          class="small secondary undo" data-act="undo" data-step="${s.id}" ${st.done ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
+        ${rb ? `<div class="accwarn${armed ? " armed" : ""}" role="${armed ? "alert" : "note"}">${esc(U.rebarWarnText(rb, lang))}${armed ? `<div>${esc(L2("Натиснете „Потвърди – излей“, за да запишете въпреки това, или „Откажи“.", "Press \"Confirm – poured\" to save anyway, or \"Cancel\"."))}</div>` : ""}</div>` : ""}
+        <div class="row"><button class="small${armed ? " armed" : ""}" data-act="mark" data-step="${s.id}" ${sel.length && w ? "" : "disabled"}>${esc(markLabel)}</button>${armed ? `<button class="small secondary" data-act="pourCancel">${esc(L2("Откажи", "Cancel"))}</button>` : ""}<button
+          class="small secondary" data-act="na" data-step="${s.id}" ${sel.length && w ? "" : "disabled"} title="${esc(t("withoutTip"))}" ${s.na ? "" : "hidden"}>${esc(t("without"))}</button><button
+          class="small secondary" data-act="note" data-step="${s.id}" ${st.done && w ? "" : "disabled"} title="${esc(t("noteOnlyTip"))}">${esc(t("noteOnly"))}</button><button
+          class="small secondary undo" data-act="undo" data-step="${s.id}" ${st.done && w ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
     }).join("");
     if (focus && $(focus.id)) {   // the re-render replaced the box the user was typing in: keep the cursor there
       const el = $(focus.id);
@@ -811,19 +1017,15 @@
       try { if (focus.start != null) el.setSelectionRange(focus.start, focus.end); } catch {}
     }
     // legend
-    $("legend").innerHTML = STAGES.map((s, k) => `<span><span class="sw" style="background:${s.colour}${k === 0 && state.seeThrough ? `;opacity:${NOT_STARTED_OPACITY + 0.25}` : ""}"></span>${esc(stepName(s))}${k === 0 && state.seeThrough ? ` <span class="sub">(${lang === "bg" ? "прозрачно" : "see-through"})</span>` : ""}</span>`).join("");
+    const counts = new Map(U.colourGroups(state.objects, (o) => S.stageOf(state.records.get(o.guid)), STAGES, false, 1).map((g) => [g.stage.id, g.objs.length]));
+    $("legend").innerHTML = STAGES.map((s, k) => `<span><span class="sw" style="background:${s.colour}${k === 0 && state.seeThrough ? `;opacity:${Math.min(1, NOT_STARTED_OPACITY + 0.25)}` : ""}"></span>${esc(stepName(s))} <b class="cnt">${counts.get(s.id) || 0}</b>${k === 0 && state.seeThrough ? ` <span class="sub">(${lang === "bg" ? "прозрачно" : "see-through"})</span>` : ""}</span>`).join("");
     // summary
     const short = lang === "bg" ? ["Кофр.", "Арм.", "Излят", "Декофр."] : ["Form.", "Rebar", "Poured", "Stripped"];
     $("sumHead").innerHTML = `<tr><th>${esc(t("pour"))}</th>${short.map((h) => `<th class="n">${h}</th>`).join("")}<th></th></tr>`;
-    const sum = S.summary(state.pours, state.records, (o) => o.guid);
-    $("sumRows").innerHTML = sum.length ? sum.map((r, i) => `<tr><td><span class="name">${esc(r.label)}</span> <span class="sub">${r.total}</span></td>${S.STEPS.map((s) => {
-        const n = r.steps[s.id];
-        return `<td class="n ${n === 0 ? "zero" : n === r.total ? "full" : "part"}">${n}/${r.total}</td>`;
-      }).join("")}<td><button class="small secondary" data-act="pickPour" data-i="${i}">${esc(t("select"))}</button></td></tr>`).join("")
-      : `<tr><td colspan="6" class="empty">No pours.</td></tr>`;
+    renderSummary();
     // pours split by Tekla after formwork/rebar
-    const splitObjs = state.objects.map((o) => Object.assign({ guid: o.guid, pour: pourOf(o), parts: (o.props || {})[C.P.parts] || "", bbox: o.bbox, key: o.key, obj: o }, { volume: liveQty(o).volume }));
-    const sp = S.splits(state.records, splitObjs);
+    const dv = derived();
+    const sp = dv.sp;
     state.splits = sp;
     $("splitBox").hidden = !sp.length;
     if (sp.length) {
@@ -839,13 +1041,13 @@
           ...x.partial.map((o, k) => row(o, x.children.length + k, false, x.exact ? L2("(частично извън)", "(partly outside)") : L2("(вероятно съседен)", "(probably a neighbour)")))].join("<br>");
         return `<tr><td><span class="name">${esc(x.record.pour || "?")}</span> <span class="sub">${x.present ? "" : L2("(вече го няма)", "(gone)")}</span>
           <div class="sub">${esc(what)} · ${vol}</div><div style="margin:4px 0">${kids}</div>
-          <button class="small" data-act="splitApply" data-i="${i}">${L2("Прехвърли", "Pass on")}</button>
+          <button class="small" data-act="splitApply" data-i="${i}"${w ? "" : " disabled"}>${L2("Прехвърли", "Pass on")}</button>
           <button class="small secondary" data-act="splitShow" data-i="${i}">${L2("Покажи", "Show")}</button>
-          ${x.present ? `<button class="small secondary" data-act="splitSkip" data-i="${i}">${L2("Не", "No")}</button>` : ""}</td></tr>`;
+          ${x.present ? `<button class="small secondary" data-act="splitSkip" data-i="${i}"${w ? "" : " disabled"}>${L2("Не", "No")}</button>` : ""}</td></tr>`;
       }).join("");
     }
     // pour break removed again: pieces merged back into one object
-    const mg = S.merges(state.records, splitObjs);
+    const mg = dv.mg;
     state.merges = mg;
     $("mergeBox").hidden = !mg.length;
     if (mg.length) {
@@ -854,29 +1056,68 @@
         return `<tr><td><span class="name">${esc(o ? pourOf(o) : "?")}</span>
           <div class="sub">${L2(`Разделянето е премахнато: ${x.gone.length + 1} части отново са един обект. Статусът остава; количествата се обединяват.`,
             `The pour break was removed: ${x.gone.length + 1} pieces are one object again. The status stays; quantities are combined.`)}</div>
-          <button class="small" data-act="mergeApply" data-i="${i}">${L2("Потвърди", "Confirm")}</button>
+          <button class="small" data-act="mergeApply" data-i="${i}"${w ? "" : " disabled"}>${L2("Потвърди", "Confirm")}</button>
           <button class="small secondary" data-act="mergeShow" data-i="${i}">${L2("Покажи", "Show")}</button></td></tr>`;
       }).join("");
     }
-    // orphans
-    const present = new Set(state.objects.map((o) => o.guid));
-    const mergedGone = new Set(mg.flatMap((x) => x.gone.map((g) => g.guid)));
-    const splitFrom = new Set([...mergedGone, ...sp.filter((x) => !x.present).map((x) => x.guid), ...[...state.records.values()].map((r) => r.split_from).filter(Boolean)]);
-    const orph = S.orphans(new Map([...state.records].filter(([g]) => !splitFrom.has(g))), present, state.objects.map((o) => ({ guid: o.guid, key: o.key, pour: o.group && (o.group.numbered ? o.group.key : o.group.label), obj: o })));
-    $("orphanBox").hidden = !orph.length;
+    // orphans: only records whose pour is in the loaded models are listed (one stage loaded = the other stages' records
+    // are not "without object"); the others are counted for admins (speed audit item 3)
+    const orph = dv.orph, hiddenOrph = dv.hiddenOrph;
+    const hiddenNote = office() && hiddenOrph ? L2(`${hiddenOrph} записа на тактове, които не са в заредените модели (други етапи или изтрити тактове), не са в списъка.`,
+      `${hiddenOrph} records of pours that are not in the loaded models (other stages or deleted pours) are not listed.`) : "";
+    $("orphanBox").hidden = !orph.length && !hiddenNote;
+    if (!orph.length && hiddenNote) { $("orphanText").textContent = hiddenNote; $("orphanRows").innerHTML = ""; state.orphans = orph; }
     if (orph.length) {
-      $("orphanText").textContent = lang === "bg"
+      $("orphanText").textContent = (lang === "bg"
         ? `${orph.length} записа със статус сочат към обекти, които вече ги няма в модела (вероятно Tekla е пресъздала такта). Свържете ги ръчно към новия обект.`
-        : `${orph.length} status records point to objects that are no longer in the model (Tekla probably rebuilt the pour). Re-attach them to the new object.`;
+        : `${orph.length} status records point to objects that are no longer in the model (Tekla probably rebuilt the pour). Re-attach them to the new object.`) + (hiddenNote ? " " + hiddenNote : "");
       // "Прехвърли" opens an inline Запиши / Откажи box (no window.confirm: Connect's frame can block it; F7)
       $("orphanRows").innerHTML = orph.map((x, i) => `<tr><td><span class="name">${esc(x.record.pour || "?")}</span>
-          <div class="sub">${esc(x.record.stage || "")} · ${esc(x.guid)}</div>
+          <div class="sub">${esc(x.record.stage || "")}${office() ? ` · ${esc(x.guid)}` : ""}</div>
           ${state.confirmOrphan === x.guid ? `<div class="confirm" role="group"><div>${esc(L2(`Да се копира статусът (${x.record.stage}) към ${x.candidates.length} обект(а) от ${x.record.pour}?`,
             `Copy the status (${x.record.stage}) to ${x.candidates.length} object(s) of ${x.record.pour}?`))}</div>
             <div class="bar"><button class="small" data-act="reattachYes" data-i="${i}"${state.reattachBusy ? " disabled" : ""}>${L2("Запиши", "Save")}</button><button class="small secondary cancel" data-act="reattachNo" data-i="${i}"${state.reattachBusy ? " disabled" : ""}>${L2("Откажи", "Cancel")}</button></div></div>` : ""}</td>
-        <td>${x.candidates.length ? `<button class="small" data-act="reattach" data-i="${i}" ${state.confirmOrphan === x.guid ? "disabled" : ""} title="${esc(x.candidates.map((c) => c.guid).join(", "))}">${lang === "bg" ? "Прехвърли" : "Re-attach"} → ${x.candidates.length} ${x.exact ? "" : "?"}</button>` : `<span class="sub">${lang === "bg" ? "няма съвпадение" : "no match"}</span>`}</td></tr>`).join("");
+        <td>${x.candidates.length ? `<button class="small" data-act="reattach" data-i="${i}" ${state.confirmOrphan === x.guid || !w ? "disabled" : ""}${office() ? ` title="${esc(x.candidates.map((c) => c.guid).join(", "))}"` : ""}>${lang === "bg" ? "Прехвърли" : "Re-attach"} → ${x.candidates.length} ${x.exact ? "" : "?"}</button>` : `<span class="sub">${lang === "bg" ? "няма съвпадение" : "no match"}</span>`}</td></tr>`).join("");
       state.orphans = orph;
     }
+  }
+
+  /** Splits, merges and orphans of the loaded objects against all records: computed once per records change (recVer)
+   *  or object reload, reused by every render (speed audit item 3: a selection click recomputed them each time). */
+  function derived() {
+    const m = derivedMemo;
+    if (m && m.ver === recVer && m.records === state.records && m.objects === state.objects) return m;
+    const splitObjs = state.objects.map((o) => Object.assign({ guid: o.guid, pour: pourOf(o), parts: (o.props || {})[C.P.parts] || "", bbox: o.bbox, key: o.key, obj: o }, { volume: liveQty(o).volume }));
+    const sp = S.splits(state.records, splitObjs);
+    const mg = S.merges(state.records, splitObjs);
+    const present = new Set(state.objects.map((o) => o.guid));
+    const mergedGone = new Set(mg.flatMap((x) => x.gone.map((g) => g.guid)));
+    const splitFrom = new Set([...mergedGone, ...sp.filter((x) => !x.present).map((x) => x.guid), ...[...state.records.values()].map((r) => r.split_from).filter(Boolean)]);
+    const all = S.orphans(new Map([...state.records].filter(([g]) => !splitFrom.has(g))), present, state.objects.map((o) => ({ guid: o.guid, key: o.key, pour: o.group && (o.group.numbered ? o.group.key : o.group.label), obj: o })));
+    const rows = U.orphanRows(all);
+    derivedMemo = { ver: recVer, records: state.records, objects: state.objects, sp, mg, orph: rows.shown, hiddenOrph: rows.hidden.length };
+    return derivedMemo;
+  }
+
+  /** Pours table, filtered by the search box (A5). Indexes stay those of state.pours ("Избери" per row). */
+  function renderSummary() {
+    const sum = S.summary(state.pours, state.records, (o) => o.guid);
+    const shown = sum.map((r, i) => ({ r, i })).filter((x) => U.matchPour(x.r.label, state.filter));
+    state.matches = shown.map((x) => x.i);
+    $("btnPickMatches").disabled = !state.filter.trim() || !shown.length;
+    $("btnPickMatches").textContent = t("selectMatches") + (state.filter.trim() && shown.length ? ` (${shown.length})` : "");
+    $("sumRows").innerHTML = shown.length ? shown.map(({ r, i }) => `<tr><td><span class="name">${esc(r.label)}</span> <span class="sub">${r.total}</span></td>${S.STEPS.map((s) => {
+        const n = r.steps[s.id];
+        return `<td class="n ${n === 0 ? "zero" : n === r.total ? "full" : "part"}">${n}/${r.total}</td>`;
+      }).join("")}<td><button class="small secondary" data-act="pickPour" data-i="${i}">${esc(t("select"))}</button></td></tr>`).join("")
+      : `<tr><td colspan="6" class="empty">${esc(sum.length ? t("noMatch") : L2("Няма тактове.", "No pours."))}</td></tr>`;
+  }
+  /** "Избери в модела": every pour object of the pours the search finds. */
+  async function selectMatches() {
+    const objs = (state.matches || []).flatMap((i) => (state.pours[i] ? state.pours[i].objects : []));
+    if (!objs.length) return report(t("noMatch"), true);
+    await selectObjects(objs);
+    setStatus(L2(`Избрани ${state.matches.length} такта (${objs.length} обекта)`, `Selected ${state.matches.length} pours (${objs.length} objects)`));
   }
 
   // Pass formwork/rebar of a split pour on to its ticked new pieces; the parent's saved outline becomes the current one.
@@ -942,13 +1183,17 @@
 
   // ---------- write protection (admins): who may write statuses in the library ----------
   async function loadProtection() {
-    if (!state.access || state.access.role !== "admin" || !state.lib) { $("protectBox").hidden = true; return; }
+    if (!ArstenAccess.hasRole(state.access, "admin") || !state.lib) { $("protectBox").hidden = true; return; }
     $("protectBox").hidden = false;
+    // One read of the project's users and groups for both blocks below (it was read twice per load; speed audit item 8).
+    // Started together with the policy read; each block still reports its own error.
+    const accessData = ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
+    accessData.catch(() => {});   // handled below; no "unhandled rejection" while the policy is read
     try {
       const policy = await state.client.getPolicy(state.lib.id);
       const d = ArstenAccess.describePolicy(policy);
       state.policy = policy;
-      const names = new Map(((await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken })).groups || []).map((g) => [g.id, g.name]));
+      const names = new Map(((await accessData).groups || []).map((g) => [g.id, g.name]));
       const lv = { edit: L2("запис", "edit"), read: L2("само четене", "read only"), none: L2("без достъп", "no access") };
       const lines = [`${L2("Всички членове", "All members")}: ${lv[d.defaultAccess]}`]
         .concat(d.groups.map((g) => `${names.get(g.id) || L2("група", "group") + " " + g.id}: ${lv[g.access]}`))
@@ -959,10 +1204,10 @@
     }
     // Who resolves to which role (names only), so the groups can be checked.
     try {
-      const data = await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
+      const data = await accessData;
       const RN = { admin: "ADMIN", gc: "GENERAL CONTRACTOR", client: "CLIENT", subcontractor: "SUBCONTRACTORS", designer: "DESIGNERS", viewer: "VIEWERS", none: L2("без достъп", "no access") };
       const list = ArstenAccess.classifyMembers(data).sort((x, y) => ArstenAccess.ROLE_ORDER.indexOf(x.role) - ArstenAccess.ROLE_ORDER.indexOf(y.role) || x.name.localeCompare(y.name));
-      $("rolesList").innerHTML = list.map((m) => `<div>${esc(m.name)} · <b>${esc(RN[m.role] || m.role)}</b>${ArstenAccess.allows("execution", m.role) ? "" : ` <span class="sub">(${L2("без достъп до панела", "no panel access")})</span>`}</div>`).join("");
+      $("rolesList").innerHTML = list.map((m) => `<div>${esc(m.name)} · <b>${esc(RN[m.role] || m.role)}</b>${ArstenAccess.allows("execution", m) ? "" : ` <span class="sub">(${L2("без достъп до панела", "no panel access")})</span>`}</div>`).join("");
       state.roleList = list;
     } catch (e) {
       $("rolesList").textContent = L2("Ролите не могат да се прочетат: ", "Cannot read the roles: ") + errText(e);
@@ -996,9 +1241,11 @@
     if (!b) return;
     const act = b.dataset.act;
     const WRITES = ["mark", "undo", "note", "na", "reattachYes", "splitApply", "splitSkip", "mergeApply", "moveLegacy", "backupGo"];
+    if ((WRITES.includes(act) || act === "reattach") && !canWrite()) return report(readOnlyText(), true);   // M3: never offer a refused write
     if (WRITES.includes(act) && reloading) return report(L2("Моделът се презарежда – опитайте след малко.", "The model is reloading – try again in a moment."), true);
     guarded(() => writing(async () => {
       if (act === "mark" || act === "undo" || act === "note" || act === "na") await applyStep(b.dataset.step, act);
+      else if (act === "pourCancel") { state.armPour = null; setStatus(L2("Отказано – нищо не е записано.", "Cancelled – nothing was saved.")); render(); }
       else if (act === "pickPour") await selectPour(state.pours[+b.dataset.i]);
       else if (act === "reattach") { state.confirmOrphan = state.orphans[+b.dataset.i].guid; render(); }
       else if (act === "reattachNo") { state.confirmOrphan = null; render(); }
@@ -1031,7 +1278,7 @@
   $("btnCsv").onclick = () => guarded(exportExcel);
   $("chkFollow").onchange = (e) => {
     state.follow = e.target.checked;
-    try { localStorage.setItem("arsten.pourStatus.follow", state.follow ? "1" : "0"); } catch {}
+    U.writePref(store, PREF.follow, state.follow);
     render();
     if (state.follow && state.ready) guarded(() => selectionFromViewer(true));
   };
@@ -1060,53 +1307,85 @@
   });
   $("chkSeeThrough").onchange = (e) => guarded(async () => {
     state.seeThrough = e.target.checked;
-    try { localStorage.setItem("arsten.pourStatus.seeThrough", state.seeThrough ? "1" : "0"); } catch {}
+    U.writePref(store, PREF.seeThrough, state.seeThrough);
     render();
     if (state.coloured) await applyColours();
   });
   $("chkHideRebar").onchange = (e) => guarded(async () => {
     state.rebarHidden = e.target.checked;
+    U.writePref(store, PREF.rebarHidden, state.rebarHidden);
     const n = await setRebarVisible(!state.rebarHidden);
     setStatus(n ? `${state.rebarHidden ? L2("Скрита армировка", "Rebar hidden") : L2("Показана армировка", "Rebar shown")}: ${n}`
       : L2("Няма армировка в заредените модели.", "No rebar in the loaded models."));
   });
-  $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; await applyColours(); });
+  $("chkColour").onchange = (e) => guarded(async () => {
+    state.coloured = e.target.checked;
+    U.writePref(store, PREF.coloured, state.coloured);   // turned off stays off next time (A7)
+    render();
+    await applyColours();
+  });
+  // Search in the pours list (A5): filters while typing; Enter = select the matches in the model.
+  $("pourSearch").addEventListener("input", (e) => { state.filter = e.target.value; if (state.ready) renderSummary(); });
+  $("pourSearch").addEventListener("keydown", (e) => { if (e.key === "Enter" && state.ready && state.filter.trim()) { e.preventDefault(); guarded(selectMatches); } });
+  $("btnPickMatches").onclick = () => guarded(selectMatches);
   $("selLang").value = lang;
-  $("selLang").onchange = (e) => { lang = e.target.value; try { localStorage.setItem("arsten.pourStatus.lang", lang); } catch {} render(); if (!state.ready && state.client) guarded(start2); };
+  $("selLang").onchange = (e) => { lang = e.target.value; try { localStorage.setItem("arsten.pourStatus.lang", lang); } catch {} render(); if (!state.ready && state.client) loadGuarded(); };
 
+  // Audit item 8 (review round 12, M6): the loaded model set {id@versionId} of the last start2 that finished. A model
+  // event that leaves it unchanged (Connect fires them for streaming and visibility too) re-reads no objects and no
+  // records: runReload only paints the colours again. A missing versionId never compares equal (U.modelSetKey).
+  let lastModelsKey = null;
   async function start2() {
+    lastModelsKey = null;
+    const modelsKey = U.modelSetKey(await loadedModels());
     const n = state.objects.length || (await loadPours());
-    if (!n) return setStatus("No pour objects found. Load a Tekla IFC exported with Arsten_PourExport (property set Pour/Такт).", true);
+    if (!n) return setStatus(L2("Няма заредени тактове. Отворете модела с тактовете (меню Модели) или изберете етап.", "No pours loaded. Open the model with the pours (Models menu) or pick a stage.")
+      + (office() ? L2(" (Нужен е Tekla IFC от Arsten_PourExport, property set Pour/Такт.)", " (Needs a Tekla IFC exported with Arsten_PourExport, property set Pour/Такт.)") : ""), true);
     if (!(await setup())) { setStatus(""); return; }
     await loadRecords();
     state.ready = true;
     $("mainBox").hidden = false;
+    render();
+    if (state.coloured) await applyColours();   // on by default: colour as soon as models and records are loaded (A7)
     const inModel = state.objects.filter((o) => state.records.has(o.guid)).length, outside = state.records.size - inModel;
     loadProtection();
     if (state.rebarHidden) { state.rebarIds = null; await setRebarVisible(false); }   // keep "hide rebar" after a model reload
     try { await loadAcceptance(); state.accError = ""; } catch (e) { console.error(e); state.accError = (e && e.message) || String(e); }
     mountPhotos();
-    setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}${outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : ""}`);
+    // One human sentence for site roles; record counts outside the model and the list fallback only for admins (A8).
+    setStatus(`${state.pours.length} ${lang === "bg" ? "такта" : "pours"}, ${n} ${lang === "bg" ? "обекта" : "pour objects"} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}`
+      + (office() && outside ? ` (+${outside} ${lang === "bg" ? "извън модела" : "outside the model"})` : "")
+      + (office() && state.listMode === "model" ? L2(" · списъкът на всички записи не се зареди – само обектите в модела", " · listing all records failed – only objects in the model") : ""));
     render();
+    lastModelsKey = modelsKey;
   }
   async function start(api, client) {
     state.api = api;
     // Access first (shared/arsten-access.js): ADMIN or GENERAL CONTRACTOR group. Nothing is read before.
-    state.access = window.ARSTEN_DEMO ? { allowed: true, role: "admin" } : await ArstenAccess.check({ api, getToken, app: "execution" });
+    const demoRole = window.ARSTEN_DEMO ? (/[?&]role=(\w+)/.exec(location.search) || [])[1] || "admin" : "";
+    // demo: an admin / GC with write access; ?nowrite = a Connect project admin outside 00_ADMIN (round 11, M3)
+    state.access = window.ARSTEN_DEMO ? { allowed: true, role: demoRole, roles: [demoRole],
+      caps: /[?&]nowrite\b/.test(location.search) ? [] : demoRole === "admin" ? ["stages", "write"] : ["write"] } : await ArstenAccess.check({ api, getToken, app: "execution" });
     if (!state.access.allowed) { state.denied = true; state.api = null; ArstenAccess.renderDenied(document.body, lang, state.access); return; }
     state.project = (await api.project.getProject()) || {};
     try { const u = await api.user.getUser(); state.user = [u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || ""; } catch {}
     state.client = client || new A.PsetClient({ region: state.project.location || "europe", getToken });
     render();
-    await guarded(start2);
+    await loadGuarded();
   }
   window.PourStatusApp = { start, state, onEvent: (e, d) => onEvent(e, d) };
 
   function onEvent(event, data) {
     if (event === "extension.accessToken") onToken(data);
     if (state.denied) return;
-    if (event === "viewer.onSelectionChanged") onViewerSelection();
-    if (event === "viewer.onModelStateChanged" && state.api) scheduleReload();
+    if (event === "viewer.onSelectionChanged") { onViewerSelection(); colourSoon(); }
+    if (event === "viewer.onModelStateChanged" && state.api) scheduleReload();   // the reload re-applies the colours (start2)
+    if (event === "viewer.onModelReset") {
+      // Connect's "Reset model" cleared colours and visibility: show that in the panel, for this session only (the
+      // remembered setting stays, so the next opening colours again).
+      state.coloured = false; state.rebarHidden = false;
+      if (state.ready) render();
+    }
   }
   // Model loaded / streamed in / stage switched: Connect fires several events in a row. Wait until it is quiet for 3 s
   // (as viewer-assembly-status does), then reload once and keep the selection by GUID; typed drafts stay (F6).
@@ -1119,6 +1398,19 @@
     clearTimeout(reloadTimer);
     reloadTimer = setTimeout(runReload, ms == null ? 3000 : ms);
   }
+  /** The first load, "Провери отново" and the language switch run start2 under the same guard as a reload (review 10
+   *  L1): never two start2 at once, so a reload can't overlap the first load (double read and colour pass) or be
+   *  overwritten by it finishing later. A model event during it only queues one reload afterwards. */
+  async function loadGuarded() {
+    if (reloading) { rerun = true; return; }
+    if (inflight > 0) { scheduleReload(1000); return; }
+    reloading = true;
+    try { await guarded(start2); }
+    finally {
+      reloading = false;
+      if (rerun) { rerun = false; scheduleReload(0); }
+    }
+  }
   async function runReload() {
     reloadTimer = null;
     if (reloading) { rerun = true; return; }
@@ -1126,6 +1418,13 @@
     reloading = true; selDuringReload = false;
     const keep = new Set(pendingKeep || state.sel.map((o) => o.guid));
     try {
+      if (state.ready && lastModelsKey != null && U.sameModelSet(lastModelsKey, U.modelSetKey(await loadedModels()))) {
+        // same models, same versions: nothing to re-read; the selection stays as it is
+        pendingKeep = null;
+        console.info("[Монолитен бетон] model event: the loaded models did not change – no reload");
+        if (state.coloured) await guarded(applyColours);
+        return;
+      }
       await guarded(async () => {
         state.objects = []; state.sel = []; state.rebarIds = null;
         await start2();

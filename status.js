@@ -8,15 +8,22 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
+  // Stage colours (week 3, A7, 17.11.2026): fully saturated, so they stand out on the grey Tekla model in Connect, also on
+  // shaded faces. Checked in test/ui.test.js: CIE Lab distance >= 60 from light (#C8C8C8) and dark (#8A8A8A) model grey,
+  // >= 50 between any two started stages. Before: #F2B705 / #E37424 / #1F4FD1 / #2E7D32 / #9E9E9E / #EC6FA0.
+  // Master copy: Статус (viewer-project-status) and viewer-admin get this file on release.
   const STEPS = [
-    { id: "formwork", en: "Formwork done", bg: "Кофраж готов", colour: "#F2B705", na: true },
-    { id: "rebar", en: "Rebar done", bg: "Армировка готова", colour: "#E37424", na: true },
-    { id: "poured", en: "Poured", bg: "Излят", colour: "#1F4FD1" },
-    { id: "stripped", en: "Formwork removed", bg: "Декофриран", colour: "#2E7D32", na: true }   // green = finished,
+    { id: "formwork", en: "Formwork done", bg: "Кофраж готов", colour: "#FFD000", na: true },
+    { id: "rebar", en: "Rebar done", bg: "Армировка готова", colour: "#FF5A00", na: true },
+    { id: "poured", en: "Poured", bg: "Излят", colour: "#0050FF" },
+    { id: "stripped", en: "Formwork removed", bg: "Декофриран", colour: "#00B84F", na: true }   // green = finished,
   ];
-  const NOT_STARTED = { id: "none", en: "Not started", bg: "Не е започнат", colour: "#9E9E9E" };
+  // Not started: dark slate, drawn see-through (SEE_THROUGH) so it reads as "still to do" without hiding what is behind.
+  const NOT_STARTED = { id: "none", en: "Not started", bg: "Не е започнат", colour: "#5E6B78" };
+  /** Opacity of "not started" when drawn see-through (0..1 in Connect). Was 0.15 in the panel: too faint to see. */
+  const SEE_THROUGH = 0.3;
   // Rebar done before formwork (e.g. columns): not ready to pour yet, so not the same colour as "rebar done".
-  const REBAR_FIRST = { id: "rebar_first", en: "Rebar done, formwork pending", bg: "Армировка готова, кофраж предстои", colour: "#EC6FA0" };
+  const REBAR_FIRST = { id: "rebar_first", en: "Rebar done, formwork pending", bg: "Армировка готова, кофраж предстои", colour: "#E6007E" };
   /** All stages in legend order. */
   const STAGES = [NOT_STARTED, STEPS[0], REBAR_FIRST, STEPS[1], STEPS[2], STEPS[3]];
 
@@ -56,7 +63,7 @@
     return {
       id: DEF_ID,
       name: "Pour status / Статус такт",
-      description: "Construction progress of a pour object (Arsten Pour status extension).",
+      description: "Construction progress of a pour object (Arsten / Multiplan Pour status extension).",
       schema: { props },
       i18n: {
         "en-US": { name: "Pour status / Статус такт", props: labels },
@@ -264,11 +271,15 @@
    * @param records Map guid -> props; present Set of guids in the model; objects [{guid, key, pour}]
    */
   function orphans(records, present, objects) {
+    // Indexed by key and by pour number (speed audit item 3: O(records × objects) before; same result, same order).
+    const byKey = new Map(), byPour = new Map();
+    const add = (m, k, o) => { const l = m.get(k); if (l) l.push(o); else m.set(k, [o]); };
+    for (const o of objects) { add(byKey, o.key, o); add(byPour, o.pour, o); }
     const out = [];
     for (const [guid, r] of records) {
       if (present.has(guid) || !stageIndex(r) || r.merged_into) continue;
-      const exact = objects.filter((o) => r.key && o.key === r.key);
-      const samePour = exact.length ? [] : objects.filter((o) => r.pour && o.pour === r.pour);
+      const exact = r.key ? (byKey.get(r.key) || []).slice() : [];
+      const samePour = exact.length || !r.pour ? [] : (byPour.get(r.pour) || []).slice();
       out.push({ guid, record: r, candidates: exact.length ? exact : samePour, exact: exact.length > 0 });
     }
     return out;
@@ -368,6 +379,42 @@
   }
   const touches = (c, p) => AXES.every((a) => Math.min(c.max[a], p.max[a]) - Math.max(c.min[a], p.min[a]) >= -tolOf(p, a));
   const partTokens = (s) => new Set(String(s || "").split(";").map((x) => x.replace(/\s+x\d+\s*$/, "").trim()).filter(Boolean));
+  /**
+   * Grid on the x/y extent of the items' boxes, for "which boxes can touch this one" without a loop over all of them.
+   * query(box, pad[3]) returns item indexes in input order: every item whose box meets `box` grown by pad per axis (a
+   * superset - the caller runs the exact test). Boxes that are not finite or very large are always returned, and a
+   * query box that is not finite or covers too many cells returns every index.
+   */
+  function boxGrid(items) {
+    const fin = (b) => !!b && !!b.min && !!b.max && AXES.every((a) => isFinite(b.min[a]) && isFinite(b.max[a]) && b.max[a] >= b.min[a]);
+    const ext = [];
+    for (const it of items) if (fin(it.bbox)) ext.push(Math.max(it.bbox.max.x - it.bbox.min.x, it.bbox.max.y - it.bbox.min.y));
+    ext.sort((a, b) => a - b);
+    const size = Math.max((ext.length ? ext[ext.length >> 1] : 0) * 2, 1e-6) || 1;
+    const cell = (v) => Math.floor(v / size);
+    const cells = new Map(), always = [];
+    items.forEach((it, i) => {
+      const b = it.bbox;
+      if (!fin(b)) { always.push(i); return; }
+      const x0 = cell(b.min.x), x1 = cell(b.max.x), y0 = cell(b.min.y), y1 = cell(b.max.y);
+      if ((x1 - x0 + 1) * (y1 - y0 + 1) > 64) { always.push(i); return; }
+      for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) {
+        const k = x + "," + y, l = cells.get(k);
+        if (l) l.push(i); else cells.set(k, [i]);
+      }
+    });
+    const everything = () => items.map((_, i) => i);
+    return {
+      query(q, pad) {
+        if (!fin(q) || !pad.every((p) => isFinite(p))) return everything();
+        const x0 = cell(q.min.x - pad[0]), x1 = cell(q.max.x + pad[0]), y0 = cell(q.min.y - pad[1]), y1 = cell(q.max.y + pad[1]);
+        if ((x1 - x0 + 1) * (y1 - y0 + 1) > Math.max(256, cells.size)) return everything();
+        const seen = new Set(always);
+        for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (const i of cells.get(x + "," + y) || []) seen.add(i);
+        return [...seen].sort((a, b) => a - b);
+      },
+    };
+  }
   const INHERIT = ["formwork", "rebar"];   // what a piece of a split pour inherits; never poured/stripped
   const hasSteps = (r) => !!r && STEPS.some((s) => r[s.id]);
 
@@ -381,6 +428,16 @@
   function splits(records, objects) {
     const byGuid = new Map(objects.map((o) => [o.guid, o]));
     const free = objects.filter((o) => o.bbox && !hasSteps(records.get(o.guid)));
+    // Indexes over the free objects (speed audit item 3): a grid on the boxes for the outline test, and by pour number
+    // for the older records. Both only narrow the loop; the tests below decide, in the order of `free` (same result).
+    let grid = null, freeByPour = null;
+    const tokenMemo = new Map();   // parts text -> tokens (the same few texts repeat on every object)
+    const tokensOf = (s) => { const k = String(s || ""); let t = tokenMemo.get(k); if (!t) tokenMemo.set(k, (t = partTokens(k))); return t; };
+    const near = (snap) => (grid || (grid = boxGrid(free))).query(snap, AXES.map((a) => 2 * Math.abs(tolOf(snap, a)) + 1e-9)).map((i) => free[i]);
+    const ofPour = (p) => {
+      if (!freeByPour) { freeByPour = new Map(); for (const o of free) { const l = freeByPour.get(o.pour); if (l) l.push(o); else freeByPour.set(o.pour, [o]); } }
+      return freeByPour.get(p) || [];
+    };
     const out = [];
     for (const [guid, r] of records) {
       const steps = INHERIT.filter((id) => r[id]);
@@ -391,12 +448,12 @@
       // A piece keeps (some of) the original's parts: a split wall is still wall. Anchors, lean concrete etc. inside the
       // outline are other pour objects, not pieces. Older exports without Parts: no filter.
       const [, oldParts, oldCentre] = String(r.key || "").split("|");
-      const tokens = partTokens(oldParts);
-      const sameParts = (o) => !tokens.size || [...partTokens(o.parts)].some((tk) => tokens.has(tk));
+      const tokens = tokensOf(oldParts);
+      const sameParts = (o) => !tokens.size || [...tokensOf(o.parts)].some((tk) => tokens.has(tk));
       if (snap) {
         const shrunk = cur && ((isFinite(snapVol) && cur.volume != null && cur.volume < snapVol * 0.99) || (cur.bbox && !inside(snap, cur.bbox)));
         if (cur && !shrunk) continue;
-        for (const o of free) {
+        for (const o of near(snap)) {
           if (o.guid === guid || !sameParts(o)) continue;
           if (inside(o.bbox, snap)) children.push(o);
           else if (overlaps(o.bbox, snap) && overlapShare(o.bbox, snap) >= 0.2) partial.push(o);
@@ -411,7 +468,7 @@
         const [, , newCentre] = String(cur.key || "").split("|");
         if (oldCentre === newCentre || !tokens.size) continue;   // geometry unchanged (a renumber alone is not a split)
         // Candidates: same pour number and parts, connected to the kept piece (directly or through another candidate).
-        const pool = free.filter((o) => o.guid !== guid && o.pour === r.pour && sameParts(o));
+        const pool = ofPour(r.pour).filter((o) => o.guid !== guid && sameParts(o));
         const comp = [];
         for (let grew = true; grew && comp.length < 10;) {
           grew = false;
@@ -475,13 +532,24 @@
    */
   function merges(records, objects) {
     const byGuid = new Map(objects.map((o) => [o.guid, o]));
+    // Only objects linked by a split can take a gone record: index them by their GUID and by their record's split_from
+    // (speed audit item 3; the first match in the order of `objects` wins, as before).
+    const idxGuid = new Map(), idxFrom = new Map();
+    const add = (m, k, i) => { const l = m.get(k); if (l) l.push(i); else m.set(k, [i]); };
+    objects.forEach((o, i) => {
+      add(idxGuid, o.guid, i);
+      const mr = records.get(o.guid);
+      if (mr && mr.split_from) add(idxFrom, mr.split_from, i);
+    });
     const out = new Map();
     for (const [g, r] of records) {
       if (byGuid.has(g) || r.merged_into || !hasSteps(r)) continue;
       const snap = bboxOf(r.snap_bbox);
       if (!snap) continue;
       const linked = (mg, mr) => mg === r.split_from || (mr && mr.split_from && (mr.split_from === g || mr.split_from === r.split_from));
-      const into = objects.find((o) => o.bbox && o.guid !== g && linked(o.guid, records.get(o.guid)) && inside(snap, o.bbox));
+      const cand = [...new Set([...(idxGuid.get(r.split_from) || []), ...(idxFrom.get(g) || []), ...(r.split_from ? idxFrom.get(r.split_from) || [] : [])])].sort((a, b) => a - b);
+      const hit = cand.find((i) => { const o = objects[i]; return o.bbox && o.guid !== g && linked(o.guid, records.get(o.guid)) && inside(snap, o.bbox); });
+      const into = hit === undefined ? undefined : objects[hit];
       if (!into) continue;
       if (!out.has(into.guid)) out.set(into.guid, { into: into.guid, gone: [] });
       out.get(into.guid).gone.push({ guid: g, record: r });
@@ -515,6 +583,6 @@
     return r;
   }
 
-  return { STEPS, NOT_STARTED, REBAR_FIRST, STAGES, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
+  return { STEPS, NOT_STARTED, REBAR_FIRST, STAGES, SEE_THROUGH, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
     markNa, isNa, setNote, splits, inherit, splitDone, merges, mergeBack, mergedInto, bboxText, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
 });

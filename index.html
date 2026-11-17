@@ -20,7 +20,7 @@
   button.secondary { background:transparent; color:var(--ink); border-color:var(--line); }
   button.small { padding:2px 7px; font-size:12px; }
   button:disabled { opacity:.45; cursor:default; }
-  select, input[type=date], input[type=text] { font:inherit; font-size:12px; padding:3px 5px; border:1px solid var(--line); border-radius:0; background:#fff; }
+  select, input[type=date], input[type=text], input[type=search] { font:inherit; font-size:12px; padding:3px 5px; border:1px solid var(--line); border-radius:0; background:#fff; }
   .box { background:var(--panel); border:1px solid var(--line); padding:8px; }
   .warn { background:#fff4e5; border:1px solid #f0c48a; padding:8px; font-size:12px; margin:6px 0; }
   .warn ol { margin:4px 0 4px 18px; padding:0; }
@@ -55,6 +55,33 @@
   .step .hint:empty { display:none; }
   .confirm { border:1px solid var(--accent); background:#fff; padding:6px; margin-top:4px; font-size:12px; }
   .confirm .bar { margin:4px 0 0; }
+  /* View box (week 3, A7): a big switch for "Оцвети по статус" at the top, the legend, then the smaller options */
+  .viewbox { border-left:4px solid var(--line); }
+  .viewbox.on { border-left-color:var(--accent); }
+  label.switch { display:flex; align-items:center; gap:8px; cursor:pointer; position:relative; font-size:12px; min-height:28px; }
+  label.switch input[type=checkbox] { position:absolute; opacity:0; width:1px; height:1px; margin:0; }
+  label.switch .sl { flex:none; width:34px; height:18px; background:#b8b4ab; position:relative; transition:background .15s; }
+  label.switch .sl::after { content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; background:#fff; transition:left .15s; }
+  label.switch input:checked + .sl { background:var(--ink); }
+  label.switch input:checked + .sl::after { left:18px; }
+  label.switch input:focus-visible + .sl { outline:2px solid var(--accent); outline-offset:2px; }
+  label.switch.main { font-size:14px; font-weight:600; min-height:36px; }
+  label.switch.main .sl { width:48px; height:26px; }
+  label.switch.main .sl::after { width:20px; height:20px; top:3px; left:3px; }
+  label.switch.main input:checked + .sl { background:var(--accent); }
+  label.switch.main input:checked + .sl::after { left:25px; }
+  .viewbox .legend { margin:6px 0; }
+  .viewbox:not(.on) .legend { opacity:.5; }
+  .legend .sw { width:12px; height:12px; }
+  .legend .cnt { font-weight:600; font-variant-numeric:tabular-nums; }
+  .vopts { display:flex; flex-wrap:wrap; gap:4px 16px; border-top:1px solid var(--line); padding-top:6px; }
+  /* "Излят" without accepted rebar (A3): warning before the write, second tap confirms */
+  .accwarn { margin-top:5px; padding:5px 7px; font-size:12px; background:#fff4e5; border:1px solid #f0c48a; }
+  .accwarn.armed { border-color:var(--bad); background:#fdecea; }
+  .accwarn.armed div { margin-top:3px; font-weight:600; }
+  button.armed { background:var(--bad); border-color:var(--bad); }
+  /* search above the pours table (A5) */
+  .search input[type=search] { flex:1 1 160px; min-width:0; }
   /* result of a write, at the bottom near the finger (A2) */
   body { padding-bottom:calc(56px + env(safe-area-inset-bottom, 0px)); }
   /* always in the DOM (screen readers), visually hidden when idle; taps pass through, and it stays left of the
@@ -66,11 +93,13 @@
   .toast.bad { background:var(--bad); }
   /* touch screens (A1): ~40 px targets, 16 px inputs (no iOS zoom), destructive buttons away from the main action */
   @media (pointer: coarse) {
-    button, button.small, select, input[type=date], input[type=text] { min-height:40px; }
+    button, button.small, select, input[type=date], input[type=text], input[type=search] { min-height:40px; }
     button.small { padding:6px 12px; font-size:14px; }
-    select, input[type=date], input[type=text] { font-size:16px; padding:6px 8px; }
+    select, input[type=date], input[type=text], input[type=search] { font-size:16px; padding:6px 8px; }
     input[type=checkbox] { width:22px; height:22px; }
     label.chk { min-height:40px; font-size:14px; }
+    label.switch { min-height:40px; font-size:14px; }
+    label.switch.main { font-size:16px; min-height:44px; }
     .bar { gap:8px; }
     .step .row { gap:8px; flex-wrap:wrap; }
     .step .row input[type=date] { width:auto; flex:1 1 150px; }
@@ -99,6 +128,17 @@
     </div>
   </div>
 
+  <h2 id="hView">View</h2>
+  <div id="viewBox" class="box viewbox">
+    <label class="switch main"><input type="checkbox" role="switch" id="chkColour"><span class="sl" aria-hidden="true"></span><span id="lblColour">Colour by status</span></label>
+    <div id="colourHint" class="sub"></div>
+    <div id="legend" class="legend"></div>
+    <div class="vopts">
+      <label class="switch"><input type="checkbox" role="switch" id="chkSeeThrough"><span class="sl" aria-hidden="true"></span><span id="lblSeeThrough">Not started see-through</span></label>
+      <label class="switch"><input type="checkbox" role="switch" id="chkHideRebar"><span class="sl" aria-hidden="true"></span><span id="lblHideRebar">Hide rebar</span></label>
+    </div>
+  </div>
+
   <h2 id="hPhotos">Снимки</h2>
   <div id="photosBox"></div>
   <div id="accBox"></div>
@@ -106,13 +146,8 @@
   <h2 id="hSteps">Steps</h2>
   <div id="steps" class="steps"></div>
 
-  <h2 id="hView">View</h2>
-  <div class="bar" style="margin:0"><label class="chk"><input type="checkbox" id="chkColour"> <span id="lblColour">Colour by status</span></label>
-    <label class="chk" style="margin-left:auto"><input type="checkbox" id="chkHideRebar"> <span id="lblHideRebar">Hide rebar</span></label></div>
-  <label class="chk" style="margin-left:12px"><input type="checkbox" id="chkSeeThrough"> <span id="lblSeeThrough">Not started see-through</span></label>
-  <div id="legend" class="legend"></div>
-
   <div class="hrow"><h2 id="hSummary">Pours</h2><button id="btnCsv" class="small secondary">Export Excel</button></div>
+  <div class="bar search"><input type="search" id="pourSearch" autocomplete="off" enterkeyhint="search"><button id="btnPickMatches" class="small secondary" disabled>Select in the model</button></div>
   <table>
     <thead id="sumHead"></thead>
     <tbody id="sumRows"></tbody>
@@ -146,14 +181,15 @@
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js" integrity="sha384-lFiNt/56q6HnUNbuy0WHO3NP6BkQjY4EH8+5eELYVfnhkB42snRTmSa3UOAlX9gg" crossorigin="anonymous"></script>
-<script src="arsten-access.js?v=c29c3b3f4f"></script>
+<script src="arsten-perf.js?v=21f7454938"></script>
+<script src="arsten-access.js?v=b6f528e602"></script>
 <script src="common.js?v=a04c428e31"></script>
-<script src="status.js?v=157dd5a2f6"></script>
+<script src="status.js?v=900f56b5c0"></script>
 <script src="arsten-links.js?v=7bf607a606"></script>
-<script src="psetapi.js?v=cb56112323"></script>
-<script src="arsten-photos.js?v=f0a7981489"></script>
-<script src="arsten-acceptance.js?v=585d7387c0"></script>
-<script src="arsten-backup.js?v=28ec966847"></script>
-<script src="app.js?v=26750a3e3c"></script>
+<script src="psetapi.js?v=3ecda69f18"></script>
+<script src="arsten-photos.js?v=0288cfea0d"></script>
+<script src="arsten-acceptance.js?v=3fb82d4a41"></script>
+<script src="arsten-backup.js?v=6474f7830d"></script>
+<script src="app.js?v=0869592769"></script>
 </body>
 </html>

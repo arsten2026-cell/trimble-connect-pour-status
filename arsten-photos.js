@@ -97,17 +97,101 @@
   function parseObjects(s) { try { const a = JSON.parse(s || "[]"); return Array.isArray(a) ? a : []; } catch { return []; } }
   const fmtSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
+  // ---------- network: timeout, retry, perf (review round 12, M1 / M2 / ?perf=1) ----------
+  // The same rules as PsetClient.request in psetapi.js (this file must also work alone; change them together):
+  //  - every call is aborted after TIMEOUT_MS (30 s; an upload's PUT: UPLOAD_TIMEOUT_MS, 120 s), the body read included,
+  //    and fails with status 0, timeout: true, "Connect не отговаря (време за изчакване) - ...". Never retried (a write
+  //    may have gone through); the panels' guards are released by their usual error paths;
+  //  - a 429 / 503 is tried again, at most RETRY_TRIES tries in all, after Retry-After (capped at 8 s) or a growing pause
+  //    from 500 ms with jitter: every GET, PUT, PATCH and DELETE (same body again: idempotent here). A POST (they all
+  //    create something in Core: a folder, an upload, a commit, an object link) only on a 429 that carries Retry-After,
+  //    which the service refused without doing it. The error that comes out carries noRetry: true (no second retry in a
+  //    caller's mapLimit);
+  //  - each try is counted as service "core" by window.ArstenPerf (shared/arsten-perf.js) when loaded and switched on.
+  const TIMEOUT_MS = 30000, UPLOAD_TIMEOUT_MS = 120000, RETRY_TRIES = 3;
+  const TIMEOUT_TEXT = "Connect не отговаря (време за изчакване)";
+  const perfLib = () => {
+    const g = typeof globalThis !== "undefined" ? globalThis : typeof self !== "undefined" ? self : {};
+    return g.ArstenPerf && typeof g.ArstenPerf.start === "function" ? g.ArstenPerf : null;
+  };
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+  function retryWait(retryAfter, attempt) {
+    const ra = Number(retryAfter);
+    return retryAfter != null && retryAfter !== "" && isFinite(ra) && ra >= 0 ? Math.min(ra * 1000, 8000)
+      : Math.min(500 * 2 ** attempt, 8000) * (0.75 + Math.random() * 0.5);
+  }
+  function mayRetry(method, status, retryAfter) {
+    if (status !== 429 && status !== 503) return false;
+    return String(method).toUpperCase() !== "POST" || (status === 429 && retryAfter != null);
+  }
+  const parseRetryAfter = (res) => {
+    let ra = null;
+    try { ra = res.headers && typeof res.headers.get === "function" ? res.headers.get("Retry-After") : null; } catch {}
+    return ra != null && ra !== "" && isFinite(Number(ra)) ? Number(ra) : null;
+  };
+  /** fetch + body text within ms; on timeout the request is aborted and an error {status: 0, timeout: true} thrown. */
+  async function fetchBody(f, url, init, ms, what) {
+    const ac = typeof AbortController === "function" ? new AbortController() : null;
+    let timer = null;
+    const late = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(Object.assign(new Error(`${TIMEOUT_TEXT} – ${what}`), { status: 0, timeout: true }));
+        try { if (ac) ac.abort(); } catch {}
+      }, ms);
+    });
+    try {
+      return await Promise.race([(async () => {
+        const res = await f(url, ac ? Object.assign({}, init, { signal: ac.signal }) : init);
+        const text = typeof res.text === "function" ? await res.text()
+          : typeof res.json === "function" ? JSON.stringify(await res.json()) : "";
+        return { res, text };
+      })(), late]);
+    } finally { clearTimeout(timer); }
+  }
+  /** One call with timeout, 429 / 503 retry and perf. o: {path (for perf), what (for messages), ms?, tries?, sleep?}.
+   *  Returns {res, text}; for a 429 / 503 left after the retries also {busy: true, retryAfter, tries}. */
+  async function send(f, url, init, o) {
+    const method = (init && init.method) || "GET";
+    for (let tries = 1; ; tries++) {
+      const p = perfLib(), h = p ? p.start("core", method, o.path) : null;
+      let got;
+      try { got = await fetchBody(f, url, init, o.ms || TIMEOUT_MS, o.what); }
+      catch (e) { if (h) p.end(h, e && e.timeout ? "timeout" : 0); throw e; }
+      if (h) p.end(h, got.res.status);
+      const st = got.res.status;
+      if (st !== 429 && st !== 503) return got;
+      const ra = parseRetryAfter(got.res);
+      if (tries < (o.tries || RETRY_TRIES) && mayRetry(method, st, ra)) {
+        if (p && p.retry) p.retry("core", method, o.path);
+        await (o.sleep || pause)(retryWait(ra, tries - 1));
+        continue;
+      }
+      return Object.assign(got, { busy: true, retryAfter: ra, tries });
+    }
+  }
+  /** The error of a failed Core call: status, and for a 429 / 503 after the retries noRetry, retryAfter, tries. */
+  function failure(message, got) {
+    const e = new Error(message);
+    e.status = got.res.status;
+    if (got.busy) { e.noRetry = true; e.retryAfter = got.retryAfter; e.tries = got.tries; }
+    return e;
+  }
+
   // ---------- Core API (browser) ----------
-  function coreClient(base, getToken) {
+  /** fetchImpl, opts {timeoutMs, tries, sleep}: tests. */
+  function coreClient(base, getToken, fetchImpl, opts) {
+    const f = fetchImpl || ((...a) => fetch(...a));
+    const o = opts || {};
     async function req(path, method = "GET", body) {
+      const what = `Core ${method} ${path.split("?")[0]}`;
       for (let attempt = 0; attempt < 3; attempt++) {
         const token = await getToken(attempt > 0);
-        const res = await fetch(base + path, { method, headers: Object.assign({ Authorization: "Bearer " + token }, body !== undefined ? { "Content-Type": "application/json" } : {}),
-          body: body !== undefined ? JSON.stringify(body) : undefined });
+        const got = await send(f, base + path, { method, headers: Object.assign({ Authorization: "Bearer " + token }, body !== undefined ? { "Content-Type": "application/json" } : {}),
+          body: body !== undefined ? JSON.stringify(body) : undefined }, { path, what, ms: o.timeoutMs, tries: o.tries, sleep: o.sleep });
+        const res = got.res;
         if (res.status === 401 && attempt < 2) continue;
-        const text = await res.text();
-        let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-        if (!res.ok) { const e = new Error(`Core ${method} ${path.split("?")[0]}: ${res.status} ${(data && (data.message || data.errorcode)) || ""}`.trim()); e.status = res.status; throw e; }
+        let data = null; try { data = got.text ? JSON.parse(got.text) : null; } catch { data = got.text; }
+        if (!res.ok) throw failure(`${what}: ${res.status} ${(data && (data.message || data.errorcode)) || ""}`.trim(), got);
         return data;
       }
     }
@@ -276,7 +360,8 @@
 
     async function uploadFile(folderId, name, blob) {
       const init = await core.req("files/fs/initiate", "POST", { parentId: folderId, parentType: "FOLDER", name });
-      const put = await fetch(init.uploadURL, { method: "PUT", body: blob, headers: { "Content-Type": "image/jpeg" } });
+      const put = (await send((...a) => fetch(...a), init.uploadURL, { method: "PUT", body: blob, headers: { "Content-Type": "image/jpeg" } },
+        { path: "upload", what: "upload PUT", ms: UPLOAD_TIMEOUT_MS })).res;
       if (!put.ok) throw new Error(`upload PUT ${put.status}`);
       const done = await core.req("files/fs/commit", "POST", { uploadId: init.uploadId });
       let id = done && (done.id || done.fileId || (done.file && done.file.id) || (done.data && done.data.id));
@@ -491,5 +576,5 @@
     return { render, reload: load, state: st };
   }
 
-  return { DEF_ID, wireZoom, existingIds, definition, photoPrefix, photoLink, fileName, exifDate, groupByDay, forObjects, parseObjects, fmtSize, coreClient, prepareImage, mount };
+  return { DEF_ID, wireZoom, existingIds, definition, photoPrefix, photoLink, fileName, exifDate, groupByDay, forObjects, parseObjects, fmtSize, coreClient, TIMEOUT_MS, UPLOAD_TIMEOUT_MS, TIMEOUT_TEXT, prepareImage, mount };
 });
