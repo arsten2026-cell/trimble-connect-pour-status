@@ -137,7 +137,307 @@
   /** The loaded models are the same as at the last finished load: both keys known and equal. */
   const sameModelSet = (a, b) => a != null && b != null && a === b;
 
-  const U = { daysBack, dateHint, boxValue, keepDrafts, readPref, writePref, colourGroups, rebarCheck, rebarWarnText, matchPour, orphanRows, modelSetKey, sameModelSet };
+  // ---------- step writes on the server copy (sweep 18.11.2026) ----------
+  /** The fields of one step a user sees in the panel (done, "не се прави", date, note). */
+  const stepFields = (rec, stepId) => {
+    const r = rec || {}, txt = (v) => (v == null ? "" : String(v));
+    return [!!r[stepId], !!(r[stepId] && r[`${stepId}_na`]), r[stepId] ? txt(r[`${stepId}_date`]) : "", r[stepId] ? txt(r[`${stepId}_note`]) : ""].join("|");
+  };
+  /** The step was changed by someone else since the panel showed it: shown = the record the panel had, fresh = the one
+   *  just read. Then the write is skipped and the user sees "changed meanwhile" (no silent overwrite of a mark or an undo). */
+  const stepChanged = (shown, fresh, stepId) => stepFields(shown, stepId) !== stepFields(fresh, stepId);
+  /** The fresh copy already holds exactly what this write would save, written by this user a few minutes ago: a write
+   *  that timed out on the phone but did go through (sweep 18.11.2026). The step's fields equal the intended ones and the
+   *  newest history line is this user's, stamped within `mins` minutes (log lines start "YYYY-MM-DD HH:MM", local time,
+   *  status.js logLine). Then the next tap reports "saved", not "changed by another user". */
+  function savedByMe(fresh, intended, stepId, user, now, mins) {
+    if (!fresh || !user || stepFields(fresh, stepId) !== stepFields(intended, stepId)) return false;
+    const by = intended && intended[`${stepId}_by`];
+    if (by && String(fresh[`${stepId}_by`] || "") !== String(by)) return false;
+    const last = String(fresh.log || "").split("\n").pop() || "";
+    const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) /.exec(last);
+    const i = last.lastIndexOf(` by ${user}`), rest = i < 0 ? null : last.slice(i + ` by ${user}`.length);
+    if (!m || rest == null || (rest !== "" && !rest.startsWith(" – "))) return false;   // "by Ivan" must not match "by Ivanov"
+    const at = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime(), t = (now || new Date()).getTime();
+    return t - at >= -60000 && t - at <= (mins || 10) * 60000;
+  }
+
+  // ---------- send for acceptance: one ToDo, requests marked with its id (sweep 18.11.2026) ----------
+  /** Requests to send, split by ToDos already created whose marking failed part-way (pending = [{todoId, links}]):
+   *  those are marked again with the SAME ToDo id (no second ToDo for the same pours); only the rest get a new ToDo. */
+  function splitSend(list, pending) {
+    const retry = [], taken = new Set();
+    for (const p of pending || []) {
+      if (!p || !p.todoId) continue;
+      const items = list.filter((r) => !taken.has(r.link) && (p.links || []).includes(r.link));
+      items.forEach((r) => taken.add(r.link));
+      if (items.length) retry.push({ todoId: p.todoId, items });
+    }
+    return { retry, fresh: list.filter((r) => !taken.has(r.link)) };
+  }
+  /** fn on every item, `n` at a time, every one tried (not stopped at the first failure): {ok: [item], failed: [{item, error}]}. */
+  async function settleAll(items, n, fn) {
+    const ok = [], failed = [];
+    await poolMap(items, n, async (it) => { try { await fn(it); ok.push(it); } catch (error) { failed.push({ item: it, error }); } });
+    return { ok, failed };
+  }
+
+  // ---------- reading pour objects (sweep 18.11.2026) ----------
+  /** sessionStorage key of "this model version has no Pour/Такт objects" (full-model scan skipped next time). */
+  const noPourKey = (projectId, modelId, ver) => `arsten.pourScan.v1.${projectId || "?"}.${modelId}@${ver}`;
+  async function poolMap(items, n, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (next < items.length) { const k = next++; out[k] = await fn(items[k], k); } }));
+    return out;
+  }
+  /**
+   * Pour objects of the loaded models: properties read `batch` at a time, `limit` chunks at once (were strictly one
+   * after the other), and per chunk the boxes and the GUIDs side by side. Results keep the model / chunk order.
+   * o.full (the proxy class filter found nothing, every object is read): a model version known to have no pour objects
+   * (o.cache, by o.versions modelId -> versionId and the object count) is skipped, and one scanned without pours is
+   * remembered - a stage with only steel or architecture loaded was read in full on every open (30 000 objects ~9 s).
+   * o: {batch, limit, mapLimit, full, versions: Map, cache: {get, set, drop}, projectId, onProgress(done, total)}
+   */
+  async function scanPours(api, modelObjs, readPset, o) {
+    o = o || {};
+    const batch = o.batch || 200, limit = o.limit || 4, mapLimit = o.mapLimit || poolMap;
+    const items = [];
+    let skipped = 0;
+    for (const m of modelObjs || []) {
+      const ids = (m.objects || []).map((x) => x.id);
+      if (!ids.length) continue;
+      const ver = o.versions && o.versions.get(m.modelId);
+      const key = o.full && ver && o.cache ? noPourKey(o.projectId, m.modelId, ver) : null;
+      if (key) { const c = o.cache.get(key); if (c && c.hasPours === false && c.n === ids.length) { skipped++; continue; } }
+      const chunks = [];
+      for (let i = 0; i < ids.length; i += batch) chunks.push(ids.slice(i, i + batch));
+      let read = 0;
+      const per = await mapLimit(chunks, limit, async (chunk) => {
+        const props = (await api.viewer.getObjectProperties(m.modelId, chunk)) || [];
+        if (o.onProps) o.onProps(m.modelId, chunk, props, ids.length);   // a full scan hands its classes to the rebar search
+        const found = [];
+        for (const p of props) { const ps = readPset(p); if (ps) found.push({ modelId: m.modelId, id: p.id, props: ps }); }
+        if (found.length) {
+          const fid = found.map((f) => f.id);
+          const [boxes, guids] = await Promise.all([
+            Promise.resolve().then(() => api.viewer.getObjectBoundingBoxes(m.modelId, fid)).catch(() => null),   // boxes are optional
+            api.viewer.convertToObjectIds(m.modelId, fid)]);
+          const byId = boxes ? new Map(boxes.map((b) => [b.id, b.boundingBox])) : null;
+          found.forEach((f, k) => { if (byId) f.bbox = byId.get(f.id) || null; f.guid = (guids || [])[k] || null; });
+        }
+        read += chunk.length;
+        if (o.onProgress) o.onProgress(read, ids.length);
+        return found.filter((f) => f.guid);
+      });
+      const got = [].concat(...per);   // one array per chunk: few arguments
+      for (const x of got) items.push(x);   // not push(...got): a whole model as call arguments overflows V8's stack (sweep 18.11.2026)
+      if (key) { if (got.length) o.cache.drop(key); else o.cache.set(key, { n: ids.length, hasPours: false }); }
+    }
+    items.skipped = skipped;
+    return items;
+  }
+
+  // ---------- rebar search (sweep 18.11.2026) ----------
+  // Rebar as Tekla exports it to IFC. Connect's native class filter returned nothing for these classes live (1028
+  // exports, 2026-11-13), so every object's class is read instead.
+  const REBAR_RE = /^(IfcReinforcingBar|IfcReinforcingMesh|IfcTendon)$/i;
+  const isRebar = (p) => !!p && REBAR_RE.test(String(p.class || ""));
+  /** sessionStorage key of the rebar runtime ids of one model version. */
+  const rebarKey = (projectId, modelId, ver) => `arsten.rebarScan.v1.${projectId || "?"}.${modelId}@${ver}`;
+  /** Same model as when its rebar was stored: object count plus first and last runtime id (cheap, catches a re-load
+   *  that numbered the objects differently, where the count alone would pass). */
+  const rebarPrint = (ids) => `${ids.length}:${ids.length ? ids[0] : ""}:${ids.length ? ids[ids.length - 1] : ""}`;
+  /**
+   * Rebar runtime ids of the loaded models, as [{modelId, objectRuntimeIds}]. Was a strict one-after-the-other read on
+   * every panel open (a remembered "Скрий армировката" made each open wait ~7-8 s on a 10k-bar model before acceptance
+   * and photos): now `limit` chunks at once, a model version found before (o.cache, sessionStorage) is not read again,
+   * and a model the pour scan already read in full (o.known: modelId -> {n, ids}) is taken from that read.
+   * o: {batch, limit, mapLimit, versions: Map, cache: {get, set}, projectId, known: Map, onProgress(done, total)}
+   */
+  async function scanRebar(api, modelObjs, o) {
+    o = o || {};
+    const batch = o.batch || 200, limit = o.limit || 4, mapLimit = o.mapLimit || poolMap;
+    const byModel = new Map();
+    for (const m of modelObjs || []) {
+      const ids = (m.objects || []).map((x) => x.id);
+      if (!ids.length) continue;
+      const ver = o.versions && o.versions.get(m.modelId), print = rebarPrint(ids);
+      const key = ver && o.cache ? rebarKey(o.projectId, m.modelId, ver) : null;
+      let found = null;
+      if (key) { const c = o.cache.get(key); if (c && c.print === print && Array.isArray(c.ids)) found = c.ids; }
+      const k = !found && o.known ? o.known.get(m.modelId) : null;
+      if (k && k.n === ids.length) found = k.ids;
+      if (!found) {
+        const chunks = [];
+        for (let i = 0; i < ids.length; i += batch) chunks.push(ids.slice(i, i + batch));
+        let read = 0;
+        const per = await mapLimit(chunks, limit, async (chunk) => {
+          const props = (await api.viewer.getObjectProperties(m.modelId, chunk)) || [];
+          read += chunk.length;
+          if (o.onProgress) o.onProgress(read, ids.length);
+          return props.filter(isRebar).map((p) => p.id);
+        });
+        found = [].concat(...per);
+      }
+      if (key) o.cache.set(key, { print, ids: found });
+      if (!byModel.has(m.modelId)) byModel.set(m.modelId, []);
+      // A loop, not push(...found): spreading a whole model's rebar ids passes each as a call argument and V8 throws
+      // "Maximum call stack size exceeded" at ~125-150k ids, on every open since the cache gives the same array
+      // (sweep 18.11.2026).
+      const into = byModel.get(m.modelId);
+      for (const id of found) into.push(id);
+    }
+    return [...byModel].filter(([, ids]) => ids.length).map(([modelId, ids]) => ({ modelId, objectRuntimeIds: [...new Set(ids)] }));
+  }
+
+  /** Why a click on a button is not run now (sweep 18.11.2026: a second tap on "Готово" while the first write was still
+   *  landing read the records again and reported the user's own write as "changed by another user").
+   *  s: {writes: [acts that write], canWrite, reloading, inflight}. Returns null (run it), "readOnly", "reloading" or "busy". */
+  function clickGate(act, s) {
+    const w = (s.writes || []).includes(act);
+    if ((w || act === "reattach") && !s.canWrite) return "readOnly";
+    if (w && s.reloading) return "reloading";
+    if (w && s.inflight > 0) return "busy";
+    return null;
+  }
+
+  // ---------- errors in plain words (sweep 18.11.2026) ----------
+  // A failed "Готово" read "Кофраж: записано 0 · 14 грешки (Failed to fetch)": it did not say that nothing was saved or
+  // what to do. shared/arsten-i18n.js (friendly / batchText) says it in plain words; the raw error goes to the console.
+  /** The sentence for an error. e.plain: the panel's own sentence (shown as it is). I18N missing: a generic text. */
+  function plainError(I18N, e, lang, noWrite) {
+    if (e && e.plain) return e.message;
+    if (I18N && I18N.friendly) return I18N.friendly(e, lang, { noWrite });
+    return lang === "en" ? "Something went wrong – try again." : "Нещо се обърка – опитайте пак.";
+  }
+  /** The tail of a toast after a backup: " · Архивът е запазен" / " · Backup saved" (never the path, any role), or the
+   *  not-uploaded text (failedText: ArstenBackup.failedText). */
+  function backupNote(res, I18N, lang, failedText) {
+    if (!res) return "";
+    if (!res.uploaded) return " · " + failedText(lang, res);
+    return " · " + (I18N && I18N.word ? I18N.word("backupSaved", lang) : lang === "en" ? "Backup saved" : "Архивът е запазен");
+  }
+  // Admin box "Права в библиотеката / Роли": read once per panel open, again after this long or on "Провери отново".
+  const PROTECT_TTL = 5 * 60 * 1000;
+  /** Is the admin rights box due for a read? at: when it was last read (0 / missing = never or failed). */
+  const protectDue = (at, now, fresh) => !!fresh || !at || now - at > PROTECT_TTL;
+  const BATCH_UNITS = { bg: ["обект", "обекта"], en: ["object", "objects"] };
+  /** The result of a step batch: "Кофраж: записано 3", or with failures "Кофраж: не е записано за 14 обекта – няма
+   *  връзка с Connect – проверете интернета и опитайте пак." err: the first error OBJECT (its status decides the text). */
+  function batchReport(I18N, what, verb, done, failed, err, lang, noWrite) {
+    if (!failed) return `${what}: ${verb} ${done}`;
+    if (I18N && I18N.batchText) return I18N.batchText(what, done, failed, err, lang, { noWrite, units: BATCH_UNITS });
+    return lang === "en" ? `${what}: ${done} saved, ${failed} not saved – try again.` : `${what}: записано ${done}, незаписано ${failed} – опитайте пак.`;
+  }
+
+  // ---------- part of a pour selected (sweep 18.11.2026) ----------
+  // A tap in the model selects ONE object, e.g. one footing of the 15 in TAKT 1; "Готово" then marked that one and the
+  // foreman believed the pour was done (Статус and the client report showed 1/15). The panel says so and offers the rest.
+  /** sel: selected pour objects ({group}). {group, have, total} when they are part of one pour, else null. */
+  function partialPour(sel) {
+    const s = sel || [];
+    const g = s.length ? s[0].group : null;
+    if (!g || !Array.isArray(g.objects) || s.some((o) => o.group !== g)) return null;
+    const have = s.length, total = g.objects.length;
+    return have < total ? { group: g, have, total } : null;
+  }
+  /** "1 от 15 обекта на TAKT 1" / "1 of 15 objects of TAKT 1". */
+  const partialText = (p, lang) => (lang === "en" ? `${p.have} of ${p.total} objects of ${p.group.label}` : `${p.have} от ${p.total} обекта на ${p.group.label}`);
+  /** The step button while the selection is part of a pour: "Готово (1 от 15)" / "Mark done (1 of 15)". */
+  const partialMark = (n, total, lang) => (lang === "en" ? `Mark done (${n} of ${total})` : `Готово (${n} от ${total})`);
+
+  // ---------- one object's step write (sweep 18.11.2026, moved here from the panel so node tests can drive it) ----------
+  /** Error for "written meanwhile by someone else" (412, the status the batch report already words). */
+  const conflictErr = () => Object.assign(new Error("changed meanwhile by another user"), { status: 412 });
+  /**
+   * One object's step write on its fresh copy f = {props, v}. Returns "changed" (another user changed the step since
+   * the panel showed `shown`: nothing written) or "done". A plain write carries the version read (writeIfUnchanged);
+   * a 409 / 412 (written meanwhile) reads once more and builds again on that copy.
+   * Undo / cleared fields replace the record (delete + re-create, psetapi.js), and the re-create carries no version
+   * (the delete itself makes a new one). Before the fix a colleague's step saved between our read and our DELETE was
+   * re-created from our older copy and silently lost (PM correcting while the foreman marks): now the version is
+   * read again just before the replace and, if it moved, the write is built again on the new copy, as for a 409.
+   * d: {user, clearsField(cur, next), isLegacy(guid), putRec(guid, next, replace), writeIfUnchanged(guid, next, v),
+   *     readOne(guid) -> {props, v} | null, onFresh(guid, props | null), onSaved(guid, next)}
+   */
+  async function writeStepFresh(o, stepId, shown, f, build, isUndo, d) {
+    for (let attempt = 0; ; attempt++) {
+      if (stepChanged(shown, f.props, stepId)) {
+        // The user's own earlier tap that timed out but did go through is not "changed by another user"
+        if (!savedByMe(f.props, build(o, shown), stepId, d.user)) return "changed";
+        d.onFresh(o.guid, f.props);
+        return "done";
+      }
+      const next = build(o, f.props);
+      const replace = !!(isUndo || d.clearsField(f.props, next));
+      const versioned = f.v !== undefined && f.v !== null && !d.isLegacy(o.guid);
+      if (replace && versioned) {
+        const r = await d.readOne(o.guid);
+        const v = r ? r.v : undefined;
+        if (v !== f.v) {
+          if (attempt) throw conflictErr();   // moved twice in a row: leave it to the user ("опитайте пак")
+          shown = f.props;   // what this write was built on; the step must still be the same on the new copy
+          f = { props: (r && r.props) || null, v };
+          d.onFresh(o.guid, f.props);
+          continue;
+        }
+      }
+      if (replace || !versioned) { await d.putRec(o.guid, next, replace); return "done"; }
+      try {
+        await d.writeIfUnchanged(o.guid, next, f.v);
+        d.onSaved(o.guid, next);
+        return "done";
+      } catch (e) {
+        if ((e.status !== 409 && e.status !== 412) || attempt) throw e;
+        const r = await d.readOne(o.guid);
+        shown = f.props;
+        f = { props: (r && r.props) || null, v: r ? r.v : undefined };
+        d.onFresh(o.guid, f.props);
+      }
+    }
+  }
+  /**
+   * Save one record whole on its FRESH copy, then read it back and check it kept what we added (sweep 18.11.2026:
+   * acceptance photo requests are written with replace = delete + re-create without a version, so two foremen sending
+   * photos for the same pour within a phone round trip each overwrote the other's photo ids). Not kept: build again on
+   * the copy read back and write again, up to `tries` times; still not kept throws a 412.
+   * d: {read() -> fresh | null, change(fresh) -> record | null (null: leave it), write(record) -> what was saved,
+   *     check(readBack) -> bool (optional), tries}
+   * Returns what was saved, or null when change() left it.
+   */
+  async function replaceChecked(d) {
+    const tries = d.tries || 3;
+    let fresh = await d.read();
+    for (let i = 0; ; i++) {
+      const next = d.change(fresh);
+      if (!next) return null;
+      const saved = await d.write(next);
+      if (!d.check) return saved;
+      fresh = await d.read();
+      if (d.check(fresh)) return saved;
+      if (i + 1 >= tries) throw conflictErr();
+    }
+  }
+
+  /** The acceptance request w ({link, props, created} from ArstenAcceptance.attachPhotos) built again on the server copy
+   *  `cur` just read (null: not there, w.props as built). Only the write for w.link is taken (the other pours of the
+   *  upload have their own); a request no longer open on the server keeps w.props, as before. args: attachPhotos args. */
+  function photosOnFresh(cur, w, args, attach) {
+    if (!cur) return w.props;
+    const r = attach([cur], Object.assign({}, args, { newId: () => "_" })).writes.find((x) => x.link === w.link && !x.created);
+    return r ? r.props : w.props;
+  }
+  /** Does the request read back hold every one of these photo ids? */
+  const hasPhotos = (rec, ids) => {
+    if (!rec) return false;
+    const have = new Set(String(rec.photos || "").split(",").map((x) => x.trim()).filter(Boolean));
+    return (ids || []).every((id) => have.has(String(id)));
+  };
+
+  const U = { daysBack, dateHint, boxValue, keepDrafts, writeStepFresh, replaceChecked, photosOnFresh, hasPhotos, readPref, writePref, colourGroups, rebarCheck, rebarWarnText, matchPour, orphanRows, modelSetKey, sameModelSet,
+    stepChanged, savedByMe, splitSend, settleAll, noPourKey, scanPours, poolMap, isRebar, rebarKey, scanRebar, clickGate,
+    plainError, batchReport, backupNote, protectDue, PROTECT_TTL, partialPour, partialText, partialMark };
   if (typeof module === "object" && module.exports) module.exports = U; else g.PourUi = U;
 })(typeof window !== "undefined" ? window : globalThis);
 
@@ -153,17 +453,21 @@
     selection: ["Избрано", "Selection"], steps: ["Етапи", "Steps"], view: ["Изглед", "View"], pours: ["Тактове", "Pours"],
     fromViewer: ["Вземи от модела", "Use viewer selection"], follow: ["Следи избора в модела", "Follow model selection"], csv: ["Експорт Excel", "Export Excel"], clear: ["Изчисти", "Clear"],
     colour: ["Оцвети по статус", "Colour by status"], seeThrough: ["Незапочнатите прозрачни", "Not started see-through"], hideRebar: ["Скрий армировката", "Hide rebar"], orphans: ["Статус без обект", "Status without object"],
+    // sweep 18.11.2026: the selection box says only this; the step area offers the list (pickFirst / toList)
+    nothingShort: ["Нищо не е избрано.", "Nothing selected."],
+    pickFirst: ["Изберете такт – в модела или от списъка", "Pick a pour – in the model or from the list"], toList: ["Към списъка ↓", "To the list ↓"],
+    pickWhole: ["Избери целия такт", "Select the whole pour"],
     nothing: ["Нищо не е избрано. Изберете тактове в модела (с отметка „Следи избора в модела“ панелът ги взема сам) или изберете такт от таблицата.",
       "Nothing selected. Select pour objects in the model (with \"Follow model selection\" ticked the panel picks them up by itself) or pick a pour in the table."],
     markDone: ["Готово", "Mark done"], undo: ["Премахни", "Remove"], note: ["Бележка (по избор)", "Note (optional)"],
-    save: ["Запиши", "Save"], without: ["Без", "Without"],
+    save: ["Запиши", "Save"], saving: ["Записване…", "Saving…"], without: ["Не се прави", "Not needed"], naShort: ["не се прави", "not needed"],   // was "Без" / "Without" (sweep 18.11.2026)
     withoutTip: ["Етапът не важи за обекта (без кофраж / без армировка). Брои се за изпълнен, без количество за фактуриране.",
       "The step does not apply to this object (no formwork / no rebar). Counts as covered, no quantity to invoice."], noteOnly: ["Само бележка", "Note only"],
     noteOnlyTip: ["Записва само бележката (датата и кой остават)", "Saves only the note (date and who stay)"],
     done: ["готови", "done"], select: ["Избери", "Select"], pour: ["Такт", "Pour"],
     colourHint: ["Цветовете показват етапа на всеки такт в модела.", "The colours show each pour's stage in the model."],
     search: ["Търси такт (номер или име)", "Find a pour (number or name)"], selectMatches: ["Избери в модела", "Select in the model"],
-    pourConfirm: ["Потвърди – излей", "Confirm – poured"], noMatch: ["Няма такт с това търсене.", "No pour matches the search."],
+    pourConfirm: ["Потвърди – излей", "Confirm – poured"], naConfirm: ["Потвърди: не се прави", "Confirm: not needed"], cancel: ["Откажи", "Cancel"], noMatch: ["Няма такт с това търсене.", "No pour matches the search."],
   };
   // one language for all tools (A10): shared key "arsten.lang" (shared/arsten-i18n.js), the old key read once
   const I18N = window.ArstenI18n, OLD_LANG = ["arsten.pourStatus.lang"];
@@ -177,7 +481,10 @@
 
   // Remembered per user (browser) settings (week 3, A7). Every storage access is wrapped (U.readPref / U.writePref).
   const store = () => { try { return window.localStorage; } catch { return null; } };
-  const PREF = { follow: "arsten.pourStatus.follow", coloured: "arsten.pourStatus.coloured", seeThrough: "arsten.pourStatus.seeThrough", rebarHidden: "arsten.pourStatus.hideRebar" };
+  const PREF = { follow: "arsten.pourStatus.follow", coloured: "arsten.pourStatus.coloured", seeThrough: "arsten.pourStatus.seeThrough", rebarHidden: "arsten.pourStatus.hideRebar",
+    naTip: "arsten.pourStatus.naTipSeen" };
+  // touch screen: no hover tooltips, so the "Не се прави" explanation is shown in the card once (sweep 18.11.2026)
+  const coarse = () => { try { return !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches); } catch { return false; } };
   const state = {
     api: null, client: null, project: null, user: "",
     lib: null, defId: S.DEF_ID, ready: false,
@@ -191,6 +498,10 @@
     seeThrough: U.readPref(store, PREF.seeThrough, true),    // not started = see-through (default on)
     filter: "",                              // search in the pours list (A5)
     armPour: null,                           // selection key armed by the first tap on "Излят" without accepted rebar (A3)
+    armUndo: null,                           // {step, key}: "Премахни" armed by its first tap, the second one writes (sweep 18.11.2026)
+    armNa: null,                             // {step, key}: "Не се прави" armed on a touch screen the first time (its tip shown)
+    lost: [],                                // [{guid, props, pour}] records deleted by a replace whose re-create failed ("Опитай пак")
+    accLost: [],                             // [{link, props, pour}] acceptance requests the same way (sweep 18.11.2026)
     drafts: {},                              // stepId -> {date?, note?} typed but not saved yet (survives re-renders; week 1, F6)
     draftSel: [],                            // GUIDs of the selection the drafts were typed for (M2)
     confirmOrphan: null,                     // guid of the orphan whose inline "Прехвърли" confirm box is open (week 1, F7)
@@ -207,7 +518,12 @@
   const readOnlyText = () => (ArstenAccess.hasRole(state.access, "admin")
     ? L2("Само преглед: добавете се в 00_ADMIN, за да записвате.", "Read only: add yourself to 00_ADMIN to save.")
     : L2("Само преглед: нямате права за запис.", "Read only: you have no rights to save."));
-  const noWriteText = () => L2("Нямате права да записвате в библиотеката " + S.LIB_NAME + ".", "You have no permission to write to the library " + S.LIB_NAME + ".");
+  // Says what to do, not the internal library name (sweep 18.11.2026); the library stays in the console for diagnostics.
+  const noWriteText = () => {
+    console.warn("[pour-status] 403: no write access to the property-set library " + S.LIB_NAME);
+    return L2("Нямате права да записвате статуси. Помолете администратора на проекта да ви добави в екипа на изпълнителя.",
+      "You cannot save statuses. Ask the project admin to add you to the contractor's team.");
+  };
   const selKey = (objs) => objs.map((o) => o.guid).sort().join("|");
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   // text may be a function: then it is built again in the new language after a language switch (round 19 L4)
@@ -237,9 +553,12 @@
   async function writing(fn) { inflight++; try { return await fn(); } finally { inflight--; } }
   const reloadBusy = () => reloading || reloadTimer != null;
   function report(text, bad) { setStatus(text, bad); toast(text, bad); }
-  // a server refusal (403) always reads as "no rights", whichever write it was (round 11, M3)
-  const errText = (e) => (e && e.status === 403 ? noWriteText() : (e && (e.message || e.toString())) || String(e));
-  async function guarded(fn) { try { await fn(); } catch (e) { const m = L2("Грешка: ", "Error: ") + errText(e); setStatus(m, true); toast(m, true); console.error(e); } }
+  // a server refusal (403) always reads as "no rights", whichever write it was (round 11, M3: plain() passes noWrite)
+  // plain words for every error (sweep 18.11.2026: "Грешка: Core PUT …: 500"); the raw error goes to the console
+  const plain = (e) => U.plainError(I18N, e, lang, noWriteText());
+  /** An Error whose text is the panel's own sentence: shown as it is (not turned into "Нещо се обърка"). */
+  const ownError = (text) => Object.assign(new Error(text), { plain: true });
+  async function guarded(fn) { try { await fn(); } catch (e) { console.error(e); const m = plain(e); setStatus(m, true); toast(m, true); } }
   async function pool(items, n, fn) {
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (next < items.length) { const k = next++; await fn(items[k], k); } }));
@@ -262,7 +581,7 @@
     const drop = () => { clearTimeout(timer); tokenWaiters = tokenWaiters.filter((f) => f !== done); p.catch(() => {}); };
     let r;
     try { r = await state.api.extension.requestPermission("accesstoken"); } catch (e) { drop(); throw e; }
-    if (r === "denied") { drop(); throw new Error(L2("Достъпът до данните в Trimble Connect е отказан за това разширение.", "Access to Trimble Connect data was denied for this extension.")); }
+    if (r === "denied") { drop(); throw ownError(L2("Достъпът до данните в Trimble Connect е отказан за това разширение.", "Access to Trimble Connect data was denied for this extension.")); }
     if (r && r !== "pending" && r !== "granted") { drop(); token = r; return r; }
     return p;
   }
@@ -272,29 +591,34 @@
   }
 
   // ---------- reading pour objects (same rules as Pour tags) ----------
-  async function loadPours() {
+  // A model version scanned in full without finding pour objects (sweep 18.11.2026, U.scanPours); sessionStorage, so
+  // a stage switch or another open in this browser tab skips it.
+  const scanCache = {
+    get: (k) => { try { const st = window.sessionStorage; return st ? JSON.parse(st.getItem(k) || "null") : null; } catch { return null; } },
+    set: (k, v) => { try { window.sessionStorage.setItem(k, JSON.stringify(v)); } catch {} },
+    drop: (k) => { try { window.sessionStorage.removeItem(k); } catch {} },
+  };
+  /** specs: getModels("loaded") of this load (for the model versions of the scan cache). */
+  async function loadPours(specs) {
     const api = state.api;
     setStatus(L2("Четене на тактовете…", "Reading pours…"));
     let modelObjs = await api.viewer.getObjects({ parameter: { class: PROXY } });
-    if (!(modelObjs || []).some((m) => (m.objects || []).length)) modelObjs = await api.viewer.getObjects();
-    const items = [];
-    for (const m of modelObjs || []) {
-      const ids = (m.objects || []).map((o) => o.id);
-      for (let i = 0; i < ids.length; i += BATCH) {
-        const props = (await api.viewer.getObjectProperties(m.modelId, ids.slice(i, i + BATCH))) || [];
-        const found = [];
-        for (const p of props) { const ps = C.readPourPset(p); if (ps) found.push({ modelId: m.modelId, id: p.id, props: ps }); }
-        if (!found.length) continue;
-        try {
-          const boxes = (await api.viewer.getObjectBoundingBoxes(m.modelId, found.map((f) => f.id))) || [];
-          const byId = new Map(boxes.map((b) => [b.id, b.boundingBox]));
-          found.forEach((f) => { f.bbox = byId.get(f.id) || null; });
-        } catch {}
-        const guids = (await api.viewer.convertToObjectIds(m.modelId, found.map((f) => f.id))) || [];
-        found.forEach((f, k) => { f.guid = guids[k] || null; });
-        items.push(...found.filter((f) => f.guid));
-      }
-    }
+    let full = false;
+    if (!(modelObjs || []).some((m) => (m.objects || []).length)) { modelObjs = await api.viewer.getObjects(); full = true; }
+    const versions = new Map();
+    for (const m of specs || []) if (m && m.versionId) { if (m.id != null) versions.set(m.id, m.versionId); versions.set(m.versionId, m.versionId); }
+    // A full scan reads every object's class anyway: the rebar ids are taken from it, so "Скрий армировката" needs no
+    // second full read (sweep 18.11.2026). Only models read to the end are kept (state.rebarSeen, used by rebarIds).
+    const seen = new Map();
+    const onProps = full ? (modelId, chunk, props, n) => {
+      const s = seen.get(modelId) || { n, read: 0, ids: [] };
+      s.read += chunk.length; s.ids.push(...props.filter(U.isRebar).map((p) => p.id));
+      seen.set(modelId, s);
+    } : null;
+    const items = await U.scanPours(api, modelObjs, C.readPourPset, { batch: BATCH, limit: 4, mapLimit: A.mapLimit, full, versions, cache: scanCache,
+      projectId: state.project && state.project.id, onProps,
+      onProgress: full ? (k, n) => setStatus(L2(`Търся тактовете… ${k} от ${n}`, `Finding pours… ${k} of ${n}`)) : null });
+    state.rebarSeen = new Map([...seen].filter(([, s]) => s.read === s.n).map(([k, s]) => [k, { n: s.n, ids: s.ids }]));
     const { pours, unnumbered } = C.groupPours(items);
     pours.forEach((g, i) => { g.colour = C.colourFor(i); });
     state.pours = pours; state.loose = unnumbered;
@@ -308,45 +632,44 @@
   }
 
   // ---------- library / definition / records ----------
-  async function setup() {
-    $("setupBox").hidden = true;
-    const found = await state.client.findLibrary(state.project.id, S.LIB_NAMES);
+  /** Library and definition check. Touches no DOM (sweep 18.11.2026: start2 runs it while the pour objects are read,
+   *  and the "no pours" message still wins): returns {ok: true, created} or {ok: false, html} for the setup box.
+   *  fresh ("Провери отново"): skip the session cache, so a library created a minute ago is found (no second library). */
+  async function setup(fresh) {
+    const o = fresh ? { fresh: true } : undefined;
+    const found = await state.client.findLibrary(state.project.id, S.LIB_NAMES, o);
     if (!found.lib && found.denied > 0) {
       console.warn("library not readable", S.LIB_NAME, JSON.stringify({ denied: found.denied }));   // round 19 M1: into the diagnostics
       // A library the user may not read exists: it may be ours, so never ask for a new one (a second CIP/Монолитно; F9).
-      showSetup(`<b>${esc(L2("Библиотеката съществува, но нямате достъп до нея – обърнете се към администратора.",
+      return { ok: false, html: `<b>${esc(L2("Библиотеката съществува, но нямате достъп до нея – обърнете се към администратора.",
         "The library exists, but you have no access to it – ask the project administrator."))}</b>
         <div class="sub">${esc(L2(`Библиотека: ${S.LIB_NAME}`, `Library: ${S.LIB_NAME}`))}</div>
-        <button id="btnRecheck" class="small">${L2("Провери отново", "Check again")}</button>`);
-      return false;
+        <button id="btnRecheck" class="small">${L2("Провери отново", "Check again")}</button>` };
     }
     if (!found.lib) {
-      showSetup(`<b>${lang === "bg" ? "Нужна е еднократна настройка от администратор на проекта." : "One-time setup by a project admin is needed."}</b>
+      return { ok: false, html: `<b>${lang === "bg" ? "Нужна е еднократна настройка от администратор на проекта." : "One-time setup by a project admin is needed."}</b>
         <ol><li>${lang === "bg" ? "Отворете" : "Open"} <b>Property Set Libraries</b> ${lang === "bg" ? "в менюто на проекта" : "in the project menu"}.</li>
         <li><b>New library</b> → ${lang === "bg" ? "име" : "name"} <b>${S.LIB_NAME}</b> → Save.</li>
         <li>${lang === "bg" ? "Върнете се тук и натиснете" : "Come back and click"} <b>${lang === "bg" ? "Провери отново" : "Check again"}</b>.</li></ol>
         ${found.others.length ? `<div class="sub">${lang === "bg" ? "Библиотеки в проекта" : "Libraries in this project"}: ${esc(found.others.join(", "))}</div>` : ""}
-        <button id="btnRecheck" class="small">${lang === "bg" ? "Провери отново" : "Check again"}</button>`);
-      return false;
+        <button id="btnRecheck" class="small">${lang === "bg" ? "Провери отново" : "Check again"}</button>` };
     }
     state.lib = found.lib;
     try {
-      const r = await state.client.ensureDefinition(found.lib.id, S.definition());
-      if (r.created) setStatus(L2("Полетата за статус са създадени в библиотеката ", "Status fields created in the library ") + found.lib.name);
+      const r = await state.client.ensureDefinition(found.lib.id, S.definition(), o);
+      return { ok: true, created: !!(r && r.created) };
     } catch (e) {
       if (e.status === 403) {
-        showSetup(lang === "bg"
+        return { ok: false, html: lang === "bg"
           ? `Библиотеката <b>${S.LIB_NAME}</b> съществува, но полетата за статус още не са създадени. Администратор на проекта трябва да отвори този панел веднъж. <button id="btnRecheck" class="small">Провери отново</button>`
-          : `The library <b>${S.LIB_NAME}</b> exists but its status fields are not created yet. A project admin has to open this panel once. <button id="btnRecheck" class="small">Check again</button>`);
-        return false;
+          : `The library <b>${S.LIB_NAME}</b> exists but its status fields are not created yet. A project admin has to open this panel once. <button id="btnRecheck" class="small">Check again</button>` };
       }
       throw e;
     }
-    return true;
   }
   function showSetup(html) {
     $("setupBox").innerHTML = html; $("setupBox").hidden = false; $("mainBox").hidden = true;
-    const b = $("btnRecheck"); if (b) b.onclick = () => loadGuarded();
+    const b = $("btnRecheck"); if (b) b.onclick = () => loadGuarded({ fresh: true });   // past the 2-minute "not found" cache (sweep 18.11.2026)
   }
   async function loadRecords() {
     // All records of the definition, including objects no longer in the model (needed for merges, splits where the
@@ -418,14 +741,14 @@
   async function backupFirst(action, links, o) {
     o = o || {};
     if (!links.length) return "";
-    if (!window.ArstenBackup) throw new Error(L2("Модулът за архив не е зареден – действието е спряно, нищо не е променено. Презаредете панела.",
+    if (!window.ArstenBackup) throw ownError(L2("Модулът за архив не е зареден – действието е спряно, нищо не е променено. Презаредете панела.",
       "The backup module is not loaded – the action was stopped, nothing was changed. Reload the panel."));
     const uniq = [...new Set(links)];
     let records;
     try {
       const now = await state.client.readMany(state.lib.id, state.defId, uniq);
       records = ArstenBackup.recordsFrom(uniq.map((link) => ({ def: state.defId, link })), new Map([[state.defId, now]]), { decode: LK.guidOfLink });
-    } catch (e) { throw new Error(L2("Архивът не може да се направи – нищо не е променено: ", "The backup could not be made – nothing was changed: ") + errText(e)); }
+    } catch (e) { console.error(e); throw ownError(L2("Архивът не може да се направи – нищо не е променено: ", "The backup could not be made – nothing was changed: ") + plain(e)); }
     const snap = ArstenBackup.snapshot({ tool: "pour", action, project: state.project, by: state.user, library: state.lib, records });
     const res = await ArstenBackup.save({ core: coreFor(), projectId: state.project.id, snapshot: snap, cache: backupCache });
     if (!res.uploaded) {
@@ -438,8 +761,10 @@
       }
       toast(ArstenBackup.failedText(lang, res), true);
     }
-    // the path only for the office side; site roles see "Архивът е запазен" (A11)
-    return office() || !I18N ? ArstenBackup.note(res, lang) : " · " + I18N.word("backupSaved", lang);
+    // "Архивът е запазен" for every role (sweep 18.11.2026: the PM's toast carried "Архив: _AM_Docs/Backups/…/….json",
+    // 3 lines over the next step's buttons); the path goes to the console, so "Копирай диагностика" still has it
+    if (res.uploaded) console.info("[backup]", res.path);
+    return U.backupNote(res, I18N, lang, ArstenBackup.failedText);
   }
   /** The inline "Продължи без архив" box of a destructive action whose backup was not uploaded (M5). */
   function backupAskBox() {
@@ -461,7 +786,7 @@
     if (!list.length || !state.lib) return;
     const bak = await backupFirst("move", list.flatMap((x) => [LK.legacyLink(x.guid), S.entityLink(x.guid)]), { destructive: true, noBackupOk, ask: { act: "moveLegacy" } });
     if (bak === null) return;
-    let done = 0, failed = 0, first = "";
+    let done = 0, failed = 0, first = null;
     setStatus(`${L2("Преместване", "Moving")}: 0/${list.length}…`);
     await pool(list, 6, async (x) => {
       try {
@@ -474,12 +799,12 @@
           await state.client.remove(state.lib.id, state.defId, LK.legacyLink(x.guid));
         }
         done++;
-      } catch (e) { failed++; if (!first) first = errText(e); }
+      } catch (e) { failed++; console.error(e); if (!first) first = e; }
       setStatus(`${L2("Преместване", "Moving")}: ${done + failed}/${list.length}…`);
     });
     await loadRecords();
     report(`${L2("Преместени", "Moved")} ${countWord(done, "запис", "записа", "record", "records")}.`
-      + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
+      + (failed ? ` · ${L2(`${failed} не са преместени`, `${failed} not moved`)} – ${plain(first)}` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failed > 0);
     render();
     if (state.coloured) await applyColours();
@@ -515,6 +840,8 @@
   function setSel(objs) {
     state.sel = objs.slice();
     if (state.armPour && state.armPour !== selKey(state.sel)) state.armPour = null;   // a confirm is for one selection only (A3)
+    if (state.armUndo && state.armUndo.key !== selKey(state.sel)) state.armUndo = null;   // same for "Премахни" (sweep 18.11.2026)
+    if (state.armNa && state.armNa.key !== selKey(state.sel)) state.armNa = null;
     if (reloadTimer != null && !reloading) pendingKeep = state.sel.map((o) => o.guid);   // a reload is waiting: restore this one
     if (Object.keys(state.drafts).length && !U.keepDrafts(state.draftSel, state.sel.map((o) => o.guid))) { state.drafts = {}; state.draftSel = []; }
   }
@@ -550,6 +877,9 @@
     const note = noteBox.value.trim();
     const objs = state.sel.slice();
     if (!objs.length) return;
+    const k = selKey(objs);
+    if (mode !== "undo") state.armUndo = null;   // another button: an armed "Премахни" is dropped
+    if (mode !== "na") state.armNa = null;
     // max = today on the box, but a typed date can still pass it (A6)
     if (!keepDate && (mode === "mark" || mode === "na") && (U.daysBack(dateBox.value, S.today()) || 0) < 0) {
       return report(L2("Датата е в бъдещето – изберете днешна или по-ранна дата.", "The date is in the future – pick today or an earlier date."), true);
@@ -560,49 +890,145 @@
     const targets = mode === "mark" || mode === "na" ? (partly ? objs.filter((o) => !has(o)) : objs) : objs.filter(has);
     if (!targets.length) return report(lang === "bg" ? "Няма обекти с този етап." : "No objects with this step.", true);
     if (mode === "note" && keepNote) return report(lang === "bg" ? "Напишете бележка." : "Type a note.", true);
+    // "Премахни" deletes dates, quantities and notes of every selected object: the first tap only arms it ("Потвърди:
+    // премахни (N)"), the second writes - the same two taps as Стомана (sweep 18.11.2026; one tap wiped "Излят" on 20 pours)
+    if (mode === "undo") {
+      if (!state.armUndo || state.armUndo.step !== stepId || state.armUndo.key !== k) {
+        state.armUndo = { step: stepId, key: k };
+        render();
+        return setStatus(L2(`Натиснете „Потвърди: премахни (${targets.length})“, за да изтриете „${stepName(step)}“, или „Откажи“.`,
+          `Press "Confirm: remove (${targets.length})" to delete "${stepName(step)}", or "Cancel".`));
+      }
+      state.armUndo = null;
+    }
+    // "Не се прави" on a touch screen: the first time, the first tap shows what it means (no hover tooltip on phones)
+    if (mode === "na" && coarse() && !U.readPref(store, PREF.naTip, false)) {
+      if (!state.armNa || state.armNa.step !== stepId || state.armNa.key !== k) {
+        state.armNa = { step: stepId, key: k };
+        render();
+        return setStatus(t("withoutTip"));
+      }
+    }
+    if (mode === "na") { state.armNa = null; U.writePref(store, PREF.naTip, true); }
     // "Излят" over pours whose rebar is not accepted: the first tap only arms the button ("Потвърди – излей"), the
     // second writes (A3; no window.confirm, Connect's frame can block it). Site reality wins, but the choice is conscious.
     const rebar = stepId === "poured" && mode === "mark" ? U.rebarCheck(window.ArstenAcceptance, state.acc, targets.filter((o) => !has(o)).map(accPour)) : null;
-    if (rebar && state.armPour !== selKey(objs)) {
-      state.armPour = selKey(objs);
+    if (rebar && state.armPour !== k) {
+      state.armPour = k;
       render();
       return report(U.rebarWarnText(rebar, lang) + L2(" – натиснете „Потвърди – излей“, за да запишете.", " – press \"Confirm – poured\" to save."), true);
     }
     const confirmed = !!rebar;
     state.armPour = null;
-    const bak = targets.length > BIG ? await backupFirst(`${stepId}-${mode}`, linksOf(targets.map((o) => o.guid))) : "";
-    let done = 0, failed = 0, firstErr = "";
-    setStatus(`${stepName(step)}: 0/${targets.length}…`);
-    await pool(targets, 6, async (o) => {
-      const cur = state.records.get(o.guid) || null;
-      const old = cur || {};
-      const next = mode === "undo" ? S.undoStep(cur, stepId, { by: state.user })
-        : mode === "note" ? S.setNote(cur, stepId, { note, by: state.user })
-        : (mode === "na" ? S.markNa : S.markStep)(cur, stepId, {
-          date: keepDate ? (old[stepId] && old[`${stepId}_date`]) || S.today() : dateBox.value,
-          note: keepNote ? old[`${stepId}_note`] || "" : note,
-          by: state.user, pour: pourOf(o), key: o.key, qty: liveQty(o)[S.STEP_QTY[stepId]], snap: snapOf(o) });
-      try {
-        await putRec(o.guid, next, mode === "undo" || S.clearsField(cur, next));
-        done++;
-      } catch (e) {
-        failed++;
-        if (e.status === 403) throw new Error(noWriteText());
-        console.error(e);
-        if (!firstErr) firstErr = e.message || String(e);
+    // From here on the step is being written: its buttons are disabled and "Готово" reads "Записване…" (sweep
+    // 18.11.2026: nothing on the button changed, so on a slow phone connection people tapped it again).
+    state.saving = stepId;
+    render();
+    try {
+      const bak = targets.length > BIG ? await backupFirst(`${stepId}-${mode}`, linksOf(targets.map((o) => o.guid))) : "";
+      // The records were read when the panel opened, maybe hours ago: read the targets' server copies now and build every
+      // write on them (sweep 18.11.2026: a mark or "Премахни" rewrote the whole 08:00 copy, wiping another user's steps
+      // and history). A step another user changed since the panel showed it is not written ("changed meanwhile").
+      setStatus(L2("Чета текущите записи…", "Reading the current records…"));
+      const shownBefore = new Map(targets.map((o) => [o.guid, state.records.get(o.guid) || null]));
+      const fresh = await readFresh(targets.map((o) => o.guid));
+      const build = (o, cur) => {
+        const old = cur || {};
+        return mode === "undo" ? S.undoStep(cur, stepId, { by: state.user })
+          : mode === "note" ? S.setNote(cur, stepId, { note, by: state.user })
+          : (mode === "na" ? S.markNa : S.markStep)(cur, stepId, {
+            date: keepDate ? (old[stepId] && old[`${stepId}_date`]) || S.today() : dateBox.value,
+            note: keepNote ? old[`${stepId}_note`] || "" : note,
+            by: state.user, pour: pourOf(o), key: o.key, qty: liveQty(o)[S.STEP_QTY[stepId]], snap: snapOf(o) });
+      };
+      let done = 0, failed = 0, firstErr = null;   // the first error OBJECT: its status picks the plain words (sweep 18.11.2026)
+      const changed = [], lostNow = [];
+      setStatus(`${stepName(step)}: 0/${targets.length}…`);
+      await pool(targets, 6, async (o) => {
+        try {
+          const r = await writeStep(o, stepId, shownBefore.get(o.guid), fresh.get(o.guid) || { props: null }, build, mode === "undo");
+          if (r === "changed") changed.push(accPour(o)); else done++;
+        } catch (e) {
+          if (e.status === 403) throw ownError(noWriteText());
+          failed++;
+          console.error(e);
+          if (e.lost) lostNow.push({ guid: o.guid, props: e.props, pour: accPour(o) });
+          if (!firstErr) firstErr = e;
+        }
+        setStatus(`${stepName(step)}: ${done}/${targets.length}…`);
+      });
+      if (lostNow.length) state.lost = state.lost.filter((x) => !lostNow.some((y) => y.guid === x.guid)).concat(lostNow);
+      const verb = mode === "undo" ? L2("премахнато", "removed") : mode === "na" ? L2("отбелязано „не се прави“", "marked not needed") : mode === "note" ? L2("бележка записана", "note saved") : L2("записано", "saved");
+      let warn = "";
+      if (stepId === "poured" && mode === "mark" && done && window.ArstenAcceptance) {
+        const not = ArstenAcceptance.rebarNotApproved(state.acc || [], targets.map(accPour));
+        if (not.length) warn = " · " + L2(`Внимание: армировката не е приета за ${not.join(", ")}`, `Warning: rebar not accepted for ${not.join(", ")}`);
       }
-      setStatus(`${stepName(step)}: ${done}/${targets.length}…`);
-    });
-    const verb = mode === "undo" ? L2("премахнато", "removed") : mode === "na" ? L2("отбелязано „без“", "marked without") : mode === "note" ? L2("бележка записана", "note saved") : L2("записано", "saved");
-    let warn = "";
-    if (stepId === "poured" && mode === "mark" && done && window.ArstenAcceptance) {
-      const not = ArstenAcceptance.rebarNotApproved(state.acc || [], targets.map(accPour));
-      if (not.length) warn = " · " + L2(`Внимание: армировката не е приета за ${not.join(", ")}`, `Warning: rebar not accepted for ${not.join(", ")}`);
+      const chg = changed.length ? " · " + L2(`${changed.length} не са записани – променени междувременно от друг потребител (${[...new Set(changed)].join(", ")}); вижте и опитайте пак`,
+        `${changed.length} not saved – changed meanwhile by another user (${[...new Set(changed)].join(", ")}); check and try again`) : "";
+      const lostTxt = lostNow.length ? " · " + L2(`${lostNow.length} записа са изтрити и не са създадени отново – натиснете „Опитай пак“`, `${lostNow.length} records were deleted and not re-created – press "Try again"`) : "";
+      if (done && !failed && !changed.length) delete state.drafts[stepId];   // saved: the boxes show the saved values again
+      report(U.batchReport(I18N, stepName(step), verb, done, failed, firstErr, lang, noWriteText()) + chg + lostTxt + warn + bak,
+        failed > 0 || changed.length > 0 || (!!warn && !confirmed));
+    } finally { state.saving = null; render(); }
+    if (state.coloured) await applyColours();
+  }
+  /** Server copies of these objects now: Map guid -> {props | null, v} (v: version of the encoded pset, for
+   *  writeIfUnchanged). Raw-"$" copies are read too and combined as at load (LK.resolve); state.records and state.legacy
+   *  take what was read. */
+  async function readFresh(guids) {
+    const c = state.client, lib = state.lib.id, def = state.defId;
+    const encL = guids.map((g) => S.entityLink(g)), legG = guids.filter((g) => LK.hasLegacy(g));
+    const readV = c.readManyV ? c.readManyV(lib, def, encL)
+      : c.readMany(lib, def, encL).then((m) => new Map([...m].map(([l, p]) => [l, { props: p, v: undefined }])));
+    const [enc, raw] = await Promise.all([readV, legG.length ? c.readMany(lib, def, legG.map(LK.legacyLink)) : new Map()]);
+    const r = LK.resolve([...enc].map(([l, x]) => [l, x.props]), raw);
+    const set = new Set(guids), out = new Map();
+    for (const g of guids) {
+      const props = r.records.get(g) || null;
+      out.set(g, { props, v: (enc.get(S.entityLink(g)) || {}).v });
+      if (props) state.records.set(g, props); else state.records.delete(g);
     }
-    if (done && !failed) delete state.drafts[stepId];   // saved: the boxes show the saved values again
-    report(`${stepName(step)}: ${verb} ${done}` + (failed ? ` · ${failed} ${lang === "bg" ? "грешки" : "failed"} (${firstErr})` : "") + warn + bak, failed > 0 || (!!warn && !confirmed));
+    state.legacy = state.legacy.filter((x) => !set.has(x.guid)).concat(r.legacy);
+    recVer++;
+    return out;
+  }
+  /** One object's step write on its fresh copy f = {props, v}: U.writeStepFresh (versioned write; a replace for undo /
+   *  cleared fields re-checks the version first, sweep 18.11.2026). Returns "changed" or "done". */
+  function writeStep(o, stepId, shown, f, build, isUndo) {
+    const c = state.client, lib = state.lib.id, def = state.defId;
+    return U.writeStepFresh(o, stepId, shown, f, build, isUndo, {
+      user: state.user,
+      clearsField: S.clearsField,
+      isLegacy: (g) => state.legacy.some((x) => x.guid === g),
+      putRec,
+      writeIfUnchanged: (g, next, v) => c.writeIfUnchanged(lib, def, S.entityLink(g), next, v),
+      readOne: (g) => c.readOne(lib, def, S.entityLink(g)),
+      onFresh: (g, props) => { if (props) state.records.set(g, props); else state.records.delete(g); recVer++; },
+      onSaved: (g, next) => { state.records.set(g, next); recVer++; },
+    });
+  }
+  /** "Опитай пак" for records a replace deleted but could not re-create (psetapi.js replace, err.lost). */
+  async function retryLost() {
+    const list = state.lost.slice();
+    if (!list.length) return;
+    let ok = 0, first = null;
+    const still = [];
+    await pool(list, 4, async (x) => {
+      try { await putRec(x.guid, x.props, true); ok++; }
+      catch (e) { still.push(x); console.error(e); if (!first) first = e; }
+    });
+    state.lost = still;
+    report(L2(`Записани отново: ${ok}`, `Written again: ${ok}`) + (still.length ? ` · ${L2(`${still.length} не са записани`, `${still.length} not written`)} – ${plain(first)}` : ""), still.length > 0);
     render();
     if (state.coloured) await applyColours();
+  }
+  function lostBox() {
+    const n = state.lost.length;
+    if (!n) return "";
+    return `<div class="warn" role="alert"><b>${esc(L2(`${n === 1 ? "1 запис е изтрит" : n + " записа са изтрити"}, но не са създадени отново (връзката прекъсна): ${[...new Set(state.lost.map((x) => x.pour))].join(", ")}.`,
+      `${n === 1 ? "1 record was" : n + " records were"} deleted but not re-created (the connection failed): ${[...new Set(state.lost.map((x) => x.pour))].join(", ")}.`))}</b>
+      <div class="bar"><button class="small" data-act="lostRetry"${canWrite() ? "" : " disabled"}>${esc(L2("Опитай пак", "Try again"))}</button></div></div>`;
   }
 
   // ---------- site photos (shared/arsten-photos.js) ----------
@@ -618,7 +1044,7 @@
     client.write = (...a) => writing(async () => {
       let r;
       try { r = await state.client.write.apply(state.client, a); }
-      catch (e) { toast(L2("Снимката не е записана: ", "Photo not saved: ") + errText(e), true); throw e; }
+      catch (e) { console.error(e); toast(L2("Снимката не е записана – ", "Photo not saved – ") + plain(e), true); throw e; }
       const rec = a[3] || {};
       if (rec.deleted) toast(L2("Снимката е изтрита", "Photo deleted"));
       else if (Date.now() - (Date.parse(rec.uploaded || "") || 0) < 120000) {
@@ -633,7 +1059,7 @@
     const baseCore = window.ARSTEN_PHOTOS_CORE || ArstenPhotos.coreClient(ArstenAccess.coreBase(state.project.location), getToken);
     const core = { req: async (path, ...rest) => {
       try { return await baseCore.req(path, ...rest); }
-      catch (e) { if (/^files\/fs\/(initiate|commit)$/.test(path)) toast(L2("Снимката не е качена: ", "Photo upload failed: ") + errText(e), true); throw e; }
+      catch (e) { if (/^files\/fs\/(initiate|commit)$/.test(path)) { console.error(e); toast(L2("Снимката не е качена – ", "Photo upload failed – ") + plain(e), true); } throw e; }
     } };
     const opts = {
       el: $("photosBox"), api: state.api, getToken, project: state.project, user: state.user, client, libId: state.lib.id,
@@ -657,27 +1083,49 @@
   async function loadAcceptance() {
     if (!window.ArstenAcceptance || !state.lib) return;
     const A = ArstenAcceptance, lib = state.lib.id;
-    for (const d of [A.definition(), A.decisionDefinition()]) { try { await state.client.ensureDefinition(lib, d); } catch (e) { if (e.status !== 403) throw e; } }
-    const m = await state.client.listAll(lib, A.DEF_ID, A.prefix(state.project.id));
-    let dec = new Map();
-    try { dec = await state.client.listAll(lib, A.DEC_ID, A.prefix(state.project.id)); } catch (e) { if (e.status !== 404) throw e; }
+    // the two definitions and then the two lists side by side (sweep 18.11.2026, as Статус 'round 12 M4'); no decision
+    // definition yet (404) = no decisions
+    await Promise.all([A.definition(), A.decisionDefinition()].map((d) => state.client.ensureDefinition(lib, d).catch((e) => { if (e.status !== 403) throw e; })));
+    const [m, dec] = await Promise.all([
+      state.client.listAll(lib, A.DEF_ID, A.prefix(state.project.id)),
+      state.client.listAll(lib, A.DEC_ID, A.prefix(state.project.id)).catch((e) => { if (e.status !== 404) throw e; return new Map(); }),
+    ]);
     // the status shown comes ONLY from the decisions (written by the 4.1 group), never from the request itself
     state.acc = A.merge([...m].map(([link, p]) => Object.assign({ link }, p)), dec);
   }
   /** Change one request on its FRESH server copy and save it whole (replace, so cleared fields are cleared).
-   *  change(fresh | null) returns the full record to save, or null to leave it. Returns the saved record or null. */
-  async function saveAcc(link, change) {
+   *  change(fresh | null) returns the full record to save, or null to leave it. Returns the saved record or null.
+   *  check(readBack) (optional, sweep 18.11.2026): the request is read back after the write and written again on that
+   *  copy while it does not hold what we added (U.replaceChecked) - replace has no version, so a colleague's write in
+   *  the same second could drop ours. A re-create lost on a weak signal (err.lost) goes to state.accLost ("Опитай пак"). */
+  async function saveAcc(link, change, check) {
     const A = ArstenAcceptance, lib = state.lib.id;
+    let dec = new Map();
     // the request and its decision read at the same time (review round 12, L8); no decision definition yet (404) = none
-    const [got, dec] = await Promise.all([
-      state.client.readMany(lib, A.DEF_ID, [link]),
-      state.client.readMany(lib, A.DEC_ID, [link]).catch((e) => { if (e.status !== 404) throw e; return new Map(); }),
-    ]);
-    const fresh = got.has(link) ? A.merge([Object.assign({ link }, got.get(link))], dec)[0] : null;
-    const next = change(fresh);
-    if (!next) return null;
-    const rec = A.reqProps(next);   // the contractor writes the REQUEST only; decisions are the 4.1 group's
-    await state.client.replace(lib, A.DEF_ID, link, rec);
+    const read = async () => {
+      const [got, d] = await Promise.all([
+        state.client.readMany(lib, A.DEF_ID, [link]),
+        state.client.readMany(lib, A.DEC_ID, [link]).catch((e) => { if (e.status !== 404) throw e; return new Map(); }),
+      ]);
+      dec = d;
+      return got.has(link) ? A.merge([Object.assign({ link }, got.get(link))], dec)[0] : null;
+    };
+    let rec;
+    try {
+      rec = await U.replaceChecked({
+        read, change, check, tries: 3,
+        // the contractor writes the REQUEST only; decisions are the 4.1 group's
+        write: async (next) => { const r = A.reqProps(next); await state.client.replace(lib, A.DEF_ID, link, r); return r; },
+      });
+    } catch (e) {
+      if (e.lost) {
+        const p = e.props || {};
+        state.accLost = state.accLost.filter((x) => x.link !== link).concat([{ link, props: p, pour: p.pour || "?" }]);
+      }
+      throw e;
+    }
+    if (!rec) return null;
+    state.accLost = state.accLost.filter((x) => x.link !== link);
     const saved = A.merge([Object.assign({ link }, rec)], dec)[0];
     const i = (state.acc || []).findIndex((r) => r.link === link);
     if (i >= 0) state.acc[i] = saved; else (state.acc = state.acc || []).push(saved);
@@ -686,10 +1134,13 @@
   let accBusy = false;
   async function acceptancePhotos(u) {
     // fresh list first, so photos join a request someone else opened meanwhile instead of creating a second one
-    try { await loadAcceptance(); } catch (e) { throw new Error(L2("Заявките за приемане не можаха да се заредят: ", "Acceptance requests could not be loaded: ") + ((e && e.message) || e)); }
-    const { writes } = ArstenAcceptance.attachPhotos(state.acc || [], { projectId: state.project.id, step: u.purpose, objects: u.objects, photoIds: u.fileIds,
-      by: state.user, newId: () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6) });
-    for (const w of writes) await saveAcc(w.link, () => w.props);
+    try { await loadAcceptance(); } catch (e) { console.error(e); throw ownError(L2("Заявките за приемане не можаха да се заредят: ", "Acceptance requests could not be loaded: ") + plain(e)); }
+    const args = { projectId: state.project.id, step: u.purpose, objects: u.objects, photoIds: u.fileIds, by: state.user };
+    const { writes } = ArstenAcceptance.attachPhotos(state.acc || [], Object.assign({ newId: () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6) }, args));
+    // Each request is built again on the copy saveAcc has just read, and read back until our photo ids are in it
+    // (sweep 18.11.2026: built once from the list above, a second foreman's send in the same second dropped the first
+    // one's photos, and both were told "Заявка за приемане: 1").
+    for (const w of writes) await saveAcc(w.link, (cur) => U.photosOnFresh(cur, w, args, ArstenAcceptance.attachPhotos), (back) => U.hasPhotos(back, u.fileIds));
     report(L2(`Заявка за приемане: ${writes.length} (изпратете с „Изпрати за приемане“)`, `Acceptance requests: ${writes.length} (send with "Send for acceptance")`));
     render();
   }
@@ -699,21 +1150,84 @@
     accBusy = true;
     try { await sendAcceptanceNow(); } finally { accBusy = false; render(); }
   }
+  // ToDos created whose requests could not all be marked sent (sweep 18.11.2026): [{todoId, links}]. Kept in
+  // sessionStorage per project, so the next "Изпрати" marks them with the SAME ToDo instead of creating a second one
+  // listing the same pours; an in-memory copy stands in when sessionStorage is blocked.
+  let accTodoMem = [];
+  const accTodoKey = () => `arsten.pourStatus.accTodo.v1.${(state.project && state.project.id) || "?"}`;
+  function readAccTodo() {
+    try { const st = window.sessionStorage, v = st && JSON.parse(st.getItem(accTodoKey()) || "null"); if (Array.isArray(v)) return v; } catch {}
+    return accTodoMem;
+  }
+  function writeAccTodo(list) {
+    accTodoMem = list;
+    try { if (list.length) window.sessionStorage.setItem(accTodoKey(), JSON.stringify(list)); else window.sessionStorage.removeItem(accTodoKey()); } catch {}
+  }
   async function sendAcceptanceNow() {
     await loadAcceptance();   // fresh: someone may have decided or sent meanwhile
     const list = ArstenAcceptance.toSend(state.acc || []);
-    if (!list.length) { render(); return report(L2("Няма неизпратени заявки.", "Nothing left to send.")); }
-    const data = await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
-    const g = (data.groups || []).find((x) => ArstenAccess.groupKey(x.name) === ArstenAccess.groupKey(ArstenAcceptance.APPROVER_GROUP));
-    if (!g) return report(L2("Няма група „4.1-STRUCTURAL DESIGNER“ в проекта.", "No group 4.1-STRUCTURAL DESIGNER in the project."), true);
-    const core = window.ARSTEN_PHOTOS_CORE || ArstenPhotos.coreClient(ArstenAccess.coreBase(state.project.location), getToken);
-    const body = ArstenAcceptance.todoBody(list, { projectId: state.project.id, groupId: g.id, lang });
-    const todo = await core.req("todos", "POST", body);
-    const todoId = (todo && (todo.id || todo.todoId)) || "";
-    // 4 requests at a time (review round 12, L8: 20 requests were ~12 s); each still re-reads its own fresh copy, and
-    // the first failure stops the rest as the loop did
-    await A.mapLimit(list, 4, (r) => saveAcc(r.link, (fresh) => (fresh && fresh.status === "open" && !fresh.sent ? ArstenAcceptance.markSent(fresh, todoId, state.user) : null)));
-    report(L2(`Изпратено за приемане: ${list.length} (една задача в Connect)`, `Sent for acceptance: ${list.length} (one Connect ToDo)`));
+    // ToDos whose requests are all sent (or no longer waiting) are dropped from the pending list
+    const { retry, fresh } = U.splitSend(list, readAccTodo());
+    if (!list.length) { writeAccTodo([]); render(); return report(L2("Няма неизпратени заявки.", "Nothing left to send.")); }
+    // Each request re-reads its own fresh copy; 4 at a time (review round 12, L8: 20 requests were ~12 s). Every request
+    // is tried (sweep 18.11.2026: the first failure stopped the rest, leaving them for a duplicate ToDo).
+    const mark = (items, todoId) => U.settleAll(items, 4, (r) => saveAcc(r.link, (cur) => (cur && cur.status === "open" && !cur.sent ? ArstenAcceptance.markSent(cur, todoId, state.user) : null)));
+    const pending = [];
+    let sent = 0, notLinked = 0, firstErr = "";
+    const tally = (res, todoId) => {
+      sent += res.ok.length;
+      if (res.failed.length) {
+        notLinked += res.failed.length;
+        pending.push({ todoId, links: res.failed.map((x) => x.item.link) });
+        if (!firstErr) { firstErr = plain(res.failed[0].error); console.error(res.failed[0].error); }
+      }
+    };
+    for (const p of retry) tally(await mark(p.items, p.todoId), p.todoId);
+    if (fresh.length) {
+      const data = await ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
+      const g = (data.groups || []).find((x) => ArstenAccess.groupKey(x.name) === ArstenAccess.groupKey(ArstenAcceptance.APPROVER_GROUP));
+      if (!g) { writeAccTodo(pending); return report(L2("Няма група „4.1-STRUCTURAL DESIGNER“ в проекта.", "No group 4.1-STRUCTURAL DESIGNER in the project."), true); }
+      const core = window.ARSTEN_PHOTOS_CORE || ArstenPhotos.coreClient(ArstenAccess.coreBase(state.project.location), getToken);
+      const body = ArstenAcceptance.todoBody(fresh, { projectId: state.project.id, groupId: g.id, lang });
+      const todo = await core.req("todos", "POST", body);
+      const todoId = (todo && (todo.id || todo.todoId)) || "";
+      // Without its id the ToDo could never be closed when the designer decides: nothing is marked sent (sweep 18.11.2026)
+      if (!todoId) {
+        writeAccTodo(pending);
+        throw ownError(L2("Connect не върна номер на задачата – заявките не са отбелязани като изпратени. Проверете задачите в Connect и опитайте пак.",
+          "Connect returned no ToDo id – the requests were not marked sent. Check the ToDos in Connect and try again."));
+      }
+      tally(await mark(fresh, todoId), todoId);
+    }
+    writeAccTodo(pending);
+    if (notLinked) report(L2(`Изпратено: ${sent} · ${notLinked} ${notLinked === 1 ? "заявка не е свързана" : "заявки не са свързани"} със задачата (${firstErr}) – Опитай пак`,
+      `Sent: ${sent} · ${notLinked} ${notLinked === 1 ? "request" : "requests"} not linked to the ToDo (${firstErr}) – Try again`), true);
+    else report(L2(`Изпратено за приемане: ${sent} (една задача в Connect)`, `Sent for acceptance: ${sent} (one Connect ToDo)`));
+    render();
+  }
+  /** Acceptance requests a replace deleted but could not re-create (sweep 18.11.2026: they vanished with their sent /
+   *  todo_id, so the Connect ToDo could never close). Shown above the requests whatever is selected. */
+  function accLostBox() {
+    const n = state.accLost.length;
+    if (!n) return "";
+    const pours = [...new Set(state.accLost.map((x) => x.pour))].join(", ");
+    return `<div class="warn" role="alert"><b>${esc(L2(`${n === 1 ? "1 заявка за приемане е изтрита" : n + " заявки за приемане са изтрити"}, но не са създадени отново (връзката прекъсна): ${pours}.`,
+      `${n === 1 ? "1 acceptance request was" : n + " acceptance requests were"} deleted but not re-created (the connection failed): ${pours}.`))}</b>
+      <div class="bar"><button class="small" data-act="accLostRetry"${canWrite() ? "" : " disabled"}>${esc(L2("Опитай пак", "Try again"))}</button></div></div>`;
+  }
+  /** "Опитай пак" for them: the saved body is written again (on a copy someone re-created meanwhile, theirs is kept). */
+  async function retryAccLost() {
+    const list = state.accLost.slice();
+    if (!list.length) return;
+    let ok = 0, first = null;
+    for (const x of list) {
+      try {
+        await saveAcc(x.link, (cur) => (cur ? null : x.props));
+        state.accLost = state.accLost.filter((y) => y.link !== x.link);   // written, or found re-created meanwhile
+        ok++;
+      } catch (e) { console.error(e); if (!first) first = e; }   // stays in the list (saveAcc keeps a lost one there)
+    }
+    report(L2(`Записани отново: ${ok}`, `Written again: ${ok}`) + (ok < list.length ? ` · ${L2(`${list.length - ok} не са записани`, `${list.length - ok} not written`)} – ${plain(first)}` : ""), ok < list.length);
     render();
   }
   function renderAcceptance() {
@@ -729,51 +1243,46 @@
       const s = A.STATUS[r.status] || A.STATUS.open;
       return `<div class="sub"><span class="sw" style="background:${s.colour}"></span>${esc(pour)} · ${esc(A.STEPS[step][lang])}: <b>${esc(s[lang])}</b>${r.status === "open" && !r.sent ? L2(" (не е изпратена към проектанта)", " (not sent to the designer yet)") : ""}${r.decided_by ? ` – ${esc(r.decided_by)} ${esc(fmtDate(r.decided, { time: true }))}` : ""}${r.comment ? `<br>„${esc(r.comment)}“` : ""}</div>`;
     };
-    box.innerHTML = pours.map((p) => row(p, "formwork") + row(p, "rebar") + row(p, "both")).join("")
+    box.innerHTML = accLostBox() + pours.map((p) => row(p, "formwork") + row(p, "rebar") + row(p, "both")).join("")
       + (pend.length ? `<div class="bar"><button class="small" id="btnSendAcc"${accBusy || !canWrite() ? " disabled" : ""}>${L2(`Изпрати за приемане (${pend.length})`, `Send for acceptance (${pend.length})`)}</button></div>` : "");
     const b = $("btnSendAcc");
     if (b) b.onclick = () => guarded(() => writing(sendAcceptance));
   }
 
   // ---------- rebar visibility ----------
-  // Rebar as Tekla exports it to IFC. Hidden/shown with the viewer's own visibility ("Reset model" shows it again).
-  const REBAR_CLASSES = ["IfcReinforcingBar", "IfcReinforcingMesh", "IfcTendon"];
-  // Not via Connect's native class filter: live it returned nothing for these classes (1028 exports, 2026-11-13), so the
-  // tick box did nothing. Read every object's class instead; done once per loaded model set (reset on model change).
-  // A model whose version and object count are the same as when its rebar was found is not read again after a reload
-  // (review round 12, L8 / audit item 14: a 10k-bar model was ~7-8 s per reload). No version known: read as before.
-  const rebarCache = new Map();   // modelId -> {ver, n: objects in the model, ids: rebar runtime ids}
-  async function rebarIds() {
-    if (state.rebarIds) return state.rebarIds;
-    const api = state.api, byModel = new Map(), next = new Map();
-    const versions = new Map();
-    for (const m of await loadedModels()) if (m && m.versionId) { if (m.id != null) versions.set(m.id, m.versionId); versions.set(m.versionId, m.versionId); }
-    const re = new RegExp(`^(${REBAR_CLASSES.join("|")})$`, "i");
-    for (const m of (await api.viewer.getObjects()) || []) {
-      const ids = (m.objects || []).map((o) => o.id), ver = versions.get(m.modelId);
-      const c = ver ? rebarCache.get(m.modelId) : null;
-      let found;
-      if (c && c.ver === ver && c.n === ids.length) found = c.ids;
-      else {
-        found = [];
-        for (let i = 0; i < ids.length; i += BATCH) {
-          setStatus(L2(`Търся армировката… ${i} от ${ids.length}`, `Finding rebar… ${i} of ${ids.length}`));
-          const props = (await api.viewer.getObjectProperties(m.modelId, ids.slice(i, i + BATCH))) || [];
-          found.push(...props.filter((p) => re.test(String(p.class || ""))).map((p) => p.id));
-        }
-      }
-      if (ver) next.set(m.modelId, { ver, n: ids.length, ids: found });
-      if (!byModel.has(m.modelId)) byModel.set(m.modelId, []);
-      byModel.get(m.modelId).push(...found);
-    }
-    rebarCache.clear();
-    for (const [k, v] of next) rebarCache.set(k, v);   // only the models loaded now
-    state.rebarIds = [...byModel].filter(([, ids]) => ids.length).map(([modelId, ids]) => ({ modelId, objectRuntimeIds: [...new Set(ids)] }));
-    return state.rebarIds;
+  // Rebar (U.isRebar: IfcReinforcingBar / Mesh / Tendon) hidden/shown with the viewer's own visibility ("Reset model"
+  // shows it again). Found by reading every object's class (U.scanRebar; the native class filter failed live).
+  // Sweep 18.11.2026: the ids of a model version are kept in sessionStorage (projectId + model + version + object
+  // count / first / last runtime id), so a reopen in the same tab hides the rebar with one setObjectState instead of a
+  // ~7-8 s full read of a 10k-bar model; an in-memory copy stands in when sessionStorage is blocked (model reloads).
+  const rebarMem = new Map();
+  const rebarStore = {
+    get: (k) => scanCache.get(k) || rebarMem.get(k) || null,
+    set: (k, v) => { rebarMem.set(k, v); scanCache.set(k, v); },
+  };
+  // One search at a time: the background hide of start2 and a tap on the tick box share it. resetRebar() (model
+  // change) drops both, and a search still running then does not store its older ids.
+  let rebarRun = null, rebarGen = 0;
+  function resetRebar() { state.rebarIds = null; rebarRun = null; rebarGen++; }
+  function rebarIds(quiet) {
+    if (state.rebarIds) return Promise.resolve(state.rebarIds);
+    if (rebarRun) return rebarRun;
+    const run = rebarRun = (async () => {
+      const api = state.api, versions = new Map();
+      for (const m of await loadedModels()) if (m && m.versionId) { if (m.id != null) versions.set(m.id, m.versionId); versions.set(m.versionId, m.versionId); }
+      const ids = await U.scanRebar(api, (await api.viewer.getObjects()) || [], { batch: BATCH, limit: 4, mapLimit: A.mapLimit, versions,
+        cache: rebarStore, projectId: state.project && state.project.id, known: state.rebarSeen,
+        onProgress: quiet ? null : (k, n) => setStatus(L2(`Търся армировката… ${k} от ${n}`, `Finding rebar… ${k} of ${n}`)) });
+      if (rebarRun === run) state.rebarIds = ids;
+      return ids;
+    })();
+    run.then(() => { if (rebarRun === run) rebarRun = null; }, () => { if (rebarRun === run) rebarRun = null; });
+    return run;
   }
-  async function setRebarVisible(visible) {
-    const ids = await rebarIds();
-    if (!ids.length) return 0;
+  /** quiet: no progress in the status line (the background hide after opening keeps the panel's summary there). */
+  async function setRebarVisible(visible, quiet) {
+    const gen = rebarGen, ids = await rebarIds(quiet);
+    if (!ids.length || gen !== rebarGen) return 0;   // the models changed meanwhile: these runtime ids are not theirs
     await state.api.viewer.setObjectState({ modelObjectIds: ids }, { visible });
     return ids.reduce((t, m) => t + m.objectRuntimeIds.length, 0);
   }
@@ -910,8 +1419,8 @@
       return ws;
     }
 
-    const qtyNote = L("Количества от модела (Tekla): кофраж = страни + дъно (m²), армировка (kg), бетон (m³). Етапи „без“ не се броят и не се фактурират. Всеки етап е с количеството, записано при отбелязването му. ",
-      "Quantities from the model (Tekla): formwork = sides + bottom (m²), rebar (kg), concrete (m³). Steps marked \"without\" are not counted or invoiced. Each step uses the quantity saved when it was marked. ");
+    const qtyNote = L("Количества от модела (Tekla): кофраж = страни + дъно (m²), армировка (kg), бетон (m³). Етапи „не се прави“ не се броят и не се фактурират. Всеки етап е с количеството, записано при отбелязването му. ",
+      "Quantities from the model (Tekla): formwork = sides + bottom (m²), rebar (kg), concrete (m³). Steps marked \"not needed\" are not counted or invoiced. Each step uses the quantity saved when it was marked. ");
     const stepCols = () => S.STEPS.flatMap((st) => [
       { h: `${stepName(st)}, ${L("бр.", "pcs")}`, w: 10, fmt: FMT.n, sum: true },
       { h: `${stepName(st)}, ${UNIT[st.id]}`, w: 13, fmt: fmtOf(UNIT[st.id]), sum: true }]);
@@ -929,7 +1438,7 @@
         { h: L("Бетон общо, m³", "Concrete total, m³"), w: 12, fmt: FMT.m3, sum: true }, { h: L("Армировка общо, kg", "Rebar total, kg"), w: 12, fmt: FMT.kg, sum: true },
         { h: L("Кофраж общо, m²", "Formwork total, m²"), w: 12, fmt: FMT.m2, sum: true }, ...stepCols(),
         { h: L("Излят, % обем", "Poured, % volume"), w: 10, fmt: FMT.pct }, { h: L("Последно излят", "Last poured"), w: 12, fmt: FMT.date },
-        { h: L("Без (бр.)", "Without (pcs)"), w: 28 }],
+        { h: L("Не се прави (бр.)", "Not needed (pcs)"), w: 28 }],
       data.pours.map((p) => [p.pour, p.types.join(", "), p.total, round(p.qty.volume, 3), round(p.qty.rebar, 1), round(p.qty.formwork, 2), ...stepVals(p.steps),
         p.qty.volume ? p.steps.poured.qty / p.qty.volume : null, toDate(p.lastPoured),
         S.STEPS.filter((st) => p.steps[st.id].na).map((st) => `${stepName(st)} ${p.steps[st.id].na}`).join(", ") || null]), 1);
@@ -943,7 +1452,7 @@
       const rows = objs.map((o) => {
         const rec = state.records.get(o.guid) || {};
         const r = [o.pour, o.type, o.parts, o.volume, o.rebar, o.formwork, stepName(S.stageOf(rec))];
-        for (const st of S.STEPS) r.push(S.isNa(rec, st.id) ? L("без", "without") : rec[st.id] ? toDate(rec[`${st.id}_date`]) : null, rec[st.id] ? rec[`${st.id}_by`] : null, rec[st.id] ? rec[`${st.id}_note`] : null);
+        for (const st of S.STEPS) r.push(S.isNa(rec, st.id) ? L("не се прави", "not needed") : rec[st.id] ? toDate(rec[`${st.id}_date`]) : null, rec[st.id] ? rec[`${st.id}_by`] : null, rec[st.id] ? rec[`${st.id}_note`] : null);
         // Frozen (invoiced) quantity that no longer matches the model, e.g. after a pour break.
         const diff = S.STEPS.filter((st) => {
           const fz = parseFloat(rec[`${st.id}_qty`]), live = o[S.STEP_QTY[st.id]];
@@ -970,6 +1479,8 @@
     $("hSel").textContent = t("selection"); $("hSteps").textContent = t("steps"); $("hView").textContent = t("view");
     $("btnCsv").textContent = t("csv");
     $("hSummary").textContent = t("pours"); $("hOrphans").textContent = t("orphans"); $("hSplits").textContent = L2("Разделени тактове", "Split pours"); $("hMerges").textContent = L2("Обединени отново", "Merged back");
+    // admin box headings followed the language too (sweep 18.11.2026: they stayed Bulgarian with "(admin)" in EN)
+    $("hProtect").textContent = L2("Права в библиотеката", "Library access"); $("hRoles").textContent = L2("Роли в проекта", "Project roles");
     $("btnFromViewer").textContent = t("fromViewer"); $("btnSelClear").textContent = t("clear");
     $("hPhotos").textContent = L2("Снимки", "Photos");
     if (state.photos) { state.photos.lang = lang; state.photos.ui.render(); }
@@ -986,12 +1497,15 @@
     $("legacyBox").innerHTML = backupAskBox() + legacyBanner();   // "Продължи без архив" (M5); raw-"$" records waiting for "Премести" (F4)
     // selection
     const sel = state.sel;
-    if (!sel.length) $("selText").innerHTML = `<span class="sub">${esc(t("nothing"))}</span>`;
+    // part of one pour (a tap in the model picks one object of it): say so and offer the whole pour (sweep 18.11.2026)
+    const part = U.partialPour(sel);
+    if (!sel.length) $("selText").innerHTML = `<span class="sub">${esc(t("nothingShort"))}</span>`;
     else {
       const byPour = new Map();
       for (const o of sel) { const k = o.group ? o.group.label : "?"; byPour.set(k, (byPour.get(k) || 0) + 1); }
-      $("selText").innerHTML = `<b>${sel.length}</b> ${lang === "bg" ? "обекта" : "pour objects"} · ` +
-        esc([...byPour].sort((a, b) => C.naturalCompare(a[0], b[0])).map(([k, n]) => (n > 1 ? `${k} (${n})` : k)).join(", "));
+      $("selText").innerHTML = `<b>${sel.length}</b> ${esc(countWord(sel.length, "обект", "обекта", "pour object", "pour objects").replace(/^\S+ /, ""))} · ` +
+        esc([...byPour].sort((a, b) => C.naturalCompare(a[0], b[0])).map(([k, n]) => (n > 1 ? `${k} (${n})` : k)).join(", "))
+        + (part ? `<div class="partpour" role="note"><span>${esc(U.partialText(part, lang))}</span><button class="small" data-act="pickWhole">${esc(t("pickWhole"))}</button></div>` : "");
     }
     // steps
     const guids = sel.map((o) => o.guid);
@@ -1000,11 +1514,15 @@
     const focus = act && /^(date|note)_/.test(act.id || "") && $("steps").contains(act)
       ? { id: act.id, start: act.type === "text" ? act.selectionStart : null, end: act.type === "text" ? act.selectionEnd : null } : null;
     const w = canWrite();
-    $("steps").innerHTML = (w ? "" : `<div class="sub bad" role="note">${esc(readOnlyText())}</div>`) + S.STEPS.map((s, i) => {
+    // Nothing selected: one line and a jump to the pours list instead of 4 cards of disabled buttons (sweep 18.11.2026:
+    // at 360 px they were ~2.5 screens before the photos, and the list - the easiest way to pick on a phone - 4 screens down)
+    $("steps").innerHTML = lostBox() + (w ? "" : `<div class="sub bad" role="note">${esc(readOnlyText())}</div>`) + (!sel.length
+      ? `<div class="pickfirst" role="note"><span>${esc(t("pickFirst"))}</span><button class="small secondary" data-act="toList">${esc(t("toList"))}</button></div>`
+      : S.STEPS.map((s, i) => {
       const st = S.stepState(state.records, guids, s.id);
       const v = S.stepValues(state.records, guids, s.id);
       const label = (!sel.length ? "" : st.state === "all" ? `✓ ${st.done}/${st.total}` : st.state === "mixed" ? `${st.done}/${st.total} ${t("done")}` : `0/${st.total}`)
-        + (st.na ? ` · ${t("without").toLowerCase()} ${st.na === st.total ? "" : st.na}`.trimEnd() : "");
+        + (st.na ? ` · ${t("naShort")} ${st.na === st.total ? "" : st.na}`.trimEnd() : "");
       // Prefill with what is saved, so a correction or a note does not reset the date. Different values: empty = keep each one's.
       // Partly done: the boxes are for the objects not done yet (today, empty note); select the done ones to correct them.
       const partly = st.state === "mixed";
@@ -1017,18 +1535,25 @@
       // "Излят": rebar acceptance of the pours this button would mark, shown BEFORE writing (A3)
       const rb = s.id === "poured" && sel.length ? U.rebarCheck(window.ArstenAcceptance, state.acc, sel.filter((o) => !(state.records.get(o.guid) || {}).poured).map(accPour)) : null;
       const armed = !!rb && state.armPour === selKey(sel);
-      const markLabel = armed ? t("pourConfirm") : partly ? `${t("markDone")} (${st.total - st.done})` : st.done ? t("save") : t("markDone");
+      // part of a pour selected: "Готово (1 от 15)" says the rest of the pour stays not done (sweep 18.11.2026)
+      const markLabel = armed ? t("pourConfirm") : partly ? (part ? U.partialMark(st.total - st.done, part.total, lang) : `${t("markDone")} (${st.total - st.done})`)
+        : st.done ? t("save") : part ? U.partialMark(sel.length, part.total, lang) : t("markDone");
+      const sk = selKey(sel);
+      const undoArmed = !!state.armUndo && state.armUndo.step === s.id && state.armUndo.key === sk && st.done > 0;
+      const naArmed = !!state.armNa && state.armNa.step === s.id && state.armNa.key === sk;
+      const saving = state.saving === s.id;   // being written: no second tap on this step (sweep 18.11.2026)
       return `<div class="step" style="--c:${s.colour}">
         <div class="hd"><span class="nm">${i + 1}. ${esc(stepName(s))}</span><span class="st ${st.state}">${label}</span></div>
         ${st.dates.length ? `<div class="dates">${esc(st.dates.map((d) => fmtDate(d)).join(", "))}</div>` : ""}
         <div class="row"><input type="date" id="date_${s.id}" max="${today}" value="${esc(dateShown)}" title="${v.mixedDate ? esc(L2("различни дати – празно = без промяна", "different dates – empty = keep")) : ""}"><input type="text" id="note_${s.id}" data-mixed="${v.mixedNote ? 1 : 0}" value="${esc(noteShown)}" placeholder="${esc(notePh)}"></div>
         <div class="hint" id="hint_${s.id}">${dr.date != null ? esc(U.dateHint(dr.date, today, lang)) : ""}</div>
         ${rb ? `<div class="accwarn${armed ? " armed" : ""}" role="${armed ? "alert" : "note"}">${esc(U.rebarWarnText(rb, lang))}${armed ? `<div>${esc(L2("Натиснете „Потвърди – излей“, за да запишете въпреки това, или „Откажи“.", "Press \"Confirm – poured\" to save anyway, or \"Cancel\"."))}</div>` : ""}</div>` : ""}
-        <div class="row"><button class="small${armed ? " armed" : ""}" data-act="mark" data-step="${s.id}" ${sel.length && w ? "" : "disabled"}>${esc(markLabel)}</button>${armed ? `<button class="small secondary" data-act="pourCancel">${esc(L2("Откажи", "Cancel"))}</button>` : ""}<button
-          class="small secondary" data-act="na" data-step="${s.id}" ${sel.length && w ? "" : "disabled"} title="${esc(t("withoutTip"))}" ${s.na ? "" : "hidden"}>${esc(t("without"))}</button><button
-          class="small secondary" data-act="note" data-step="${s.id}" ${st.done && w ? "" : "disabled"} title="${esc(t("noteOnlyTip"))}">${esc(t("noteOnly"))}</button><button
-          class="small secondary undo" data-act="undo" data-step="${s.id}" ${st.done && w ? "" : "disabled"}>${esc(t("undo"))}</button></div></div>`;
-    }).join("");
+        <div class="row"><button class="small${armed ? " armed" : ""}" data-act="mark" data-step="${s.id}" ${sel.length && w && !saving ? "" : "disabled"}${saving ? ' aria-busy="true"' : ""}>${esc(saving ? t("saving") : markLabel)}</button>${armed ? `<button class="small secondary" data-act="pourCancel">${esc(t("cancel"))}</button>` : ""}<button
+          class="small${naArmed ? " armed" : " secondary"}" data-act="na" data-step="${s.id}" ${sel.length && w && !saving ? "" : "disabled"} title="${esc(t("withoutTip"))}" ${s.na ? "" : "hidden"}>${esc(naArmed ? t("naConfirm") : t("without"))}</button>${naArmed ? `<button class="small secondary" data-act="naCancel">${esc(t("cancel"))}</button>` : ""}<button
+          class="small secondary" data-act="note" data-step="${s.id}" ${st.done && w && !saving ? "" : "disabled"} title="${esc(t("noteOnlyTip"))}">${esc(t("noteOnly"))}</button>${undoArmed ? `<button class="small secondary" data-act="undoCancel">${esc(t("cancel"))}</button>` : ""}<button
+          class="small${undoArmed ? " armed" : " secondary"} undo" data-act="undo" data-step="${s.id}" ${st.done && w && !saving ? "" : "disabled"}>${esc(undoArmed ? L2(`Потвърди: премахни (${st.done})`, `Confirm: remove (${st.done})`) : t("undo"))}</button></div>
+        ${naArmed ? `<div class="sub natip" role="note">${esc(t("withoutTip"))} ${esc(L2("Натиснете отново, за да запишете.", "Press again to save."))}</div>` : ""}</div>`;
+    }).join(""));
     if (focus && $(focus.id)) {   // the re-render replaced the box the user was typing in: keep the cursor there
       const el = $(focus.id);
       el.focus();
@@ -1051,17 +1576,18 @@
         "These pours were split in Tekla after their formwork/rebar was marked. The new pieces can take over the status.");
       const f3 = (v) => (v == null ? "?" : (Math.round(v * 100) / 100).toLocaleString(lang === "bg" ? "bg-BG" : "en-GB"));
       $("splitRows").innerHTML = sp.map((x, i) => {
-        const what = x.steps.map((id) => `${stepName(S.STEPS.find((s) => s.id === id))}${x.record[id + "_na"] ? " (" + t("without").toLowerCase() + ")" : ""} ${fmtDate(x.record[id + "_date"] || "")}`).join(", ");
+        const what = x.steps.map((id) => `${stepName(S.STEPS.find((s) => s.id === id))}${x.record[id + "_na"] ? " (" + t("naShort") + ")" : ""} ${fmtDate(x.record[id + "_date"] || "")}`).join(", ");
         const vol = x.snapVol == null ? `<span class="sub">${L2("няма записан обем – проверете частите", "no saved volume – check the pieces")}</span>`
           : `${L2("обем", "volume")} ${f3(x.snapVol)} m³ ${x.volOk ? "= " : "≠ "}${f3(x.sumVol)} ${x.volOk ? "✓" : "⚠"}`;
         const row = (o, k, ticked, tag) => `<label class="chk"><input type="checkbox" data-split="${i}" data-k="${k}" ${ticked ? "checked" : ""}> ${esc(o.pour || "?")} · ${f3(o.volume)} m³${tag ? ` <span class="sub">${tag}</span>` : ""}</label>`;
         const kids = [...x.children.map((o, k) => row(o, k, true, x.exact ? "" : L2("(проверете)", "(check)"))),
           ...x.partial.map((o, k) => row(o, x.children.length + k, false, x.exact ? L2("(частично извън)", "(partly outside)") : L2("(вероятно съседен)", "(probably a neighbour)")))].join("<br>");
+        // "Не" alone did not say what is refused, next to "Покажи", and it dismisses the split for good (sweep 18.11.2026)
         return `<tr><td><span class="name">${esc(x.record.pour || "?")}</span> <span class="sub">${x.present ? "" : L2("(вече го няма)", "(gone)")}</span>
           <div class="sub">${esc(what)} · ${vol}</div><div style="margin:4px 0">${kids}</div>
-          <button class="small" data-act="splitApply" data-i="${i}"${w ? "" : " disabled"}>${L2("Прехвърли", "Pass on")}</button>
+          <button class="small" data-act="splitApply" data-i="${i}"${w ? "" : " disabled"}>${L2("Прехвърли статуса", "Pass on status")}</button>
           <button class="small secondary" data-act="splitShow" data-i="${i}">${L2("Покажи", "Show")}</button>
-          ${x.present ? `<button class="small secondary" data-act="splitSkip" data-i="${i}"${w ? "" : " disabled"}>${L2("Не", "No")}</button>` : ""}</td></tr>`;
+          ${x.present ? `<button class="small secondary" data-act="splitSkip" data-i="${i}"${w ? "" : " disabled"} title="${esc(L2("Новите части започват без статус", "The new pieces start with no status"))}">${L2("Не прехвърляй", "Don't pass on")}</button>` : ""}</td></tr>`;
       }).join("");
     }
     // pour break removed again: pieces merged back into one object
@@ -1207,6 +1733,7 @@
   async function loadProtection() {
     if (!ArstenAccess.hasRole(state.access, "admin") || !state.lib) { $("protectBox").hidden = true; return; }
     $("protectBox").hidden = false;
+    state.protectAt = Date.now();   // read now; a failed read is tried again on the next load (below)
     // One read of the project's users and groups for both blocks below (it was read twice per load; speed audit item 8).
     // Started together with the policy read; each block still reports its own error.
     const accessData = ArstenAccess.loadProjectAccess({ projectId: state.project.id, location: state.project.location, getToken });
@@ -1222,7 +1749,8 @@
         .concat([d.adminsWrite || d.everyoneWrites ? "" : L2("ADMIN: записва само ако е в група със запис.", "ADMIN: can write only through a group with edit access.")]).filter(Boolean);
       $("protectText").innerHTML = lines.map((x) => `<div>${esc(x)}</div>`).join("") + `<div class="sub" style="margin-top:4px">${esc(L2("Промяна: Property Set Libraries → CIP/Монолитно → иконата с човек (Library access control) → Save → Publish.", "Change it in Property Set Libraries → CIP/Монолитно → person icon (Library access control) → Save → Publish."))}</div>`;
     } catch (e) {
-      $("protectText").textContent = L2("Правата на библиотеката не могат да се прочетат: ", "Cannot read the library rights: ") + errText(e);
+      state.protectAt = 0;
+      $("protectText").textContent = L2("Правата на библиотеката не могат да се прочетат: ", "Cannot read the library rights: ") + plain(e);
     }
     // Who resolves to which role (names only), so the groups can be checked.
     try {
@@ -1232,7 +1760,8 @@
       $("rolesList").innerHTML = list.map((m) => `<div>${esc(m.name)} · <b>${esc(RN[m.role] || m.role)}</b>${ArstenAccess.allows("execution", m) ? "" : ` <span class="sub">(${L2("без достъп до панела", "no panel access")})</span>`}</div>`).join("");
       state.roleList = list;
     } catch (e) {
-      $("rolesList").textContent = L2("Ролите не могат да се прочетат: ", "Cannot read the roles: ") + errText(e);
+      state.protectAt = 0;
+      $("rolesList").textContent = L2("Ролите не могат да се прочетат: ", "Cannot read the roles: ") + plain(e);
     }
   }
 
@@ -1262,13 +1791,22 @@
     const b = e.target.closest("button[data-act]");
     if (!b) return;
     const act = b.dataset.act;
-    const WRITES = ["mark", "undo", "note", "na", "reattachYes", "splitApply", "splitSkip", "mergeApply", "moveLegacy", "backupGo"];
-    if ((WRITES.includes(act) || act === "reattach") && !canWrite()) return report(readOnlyText(), true);   // M3: never offer a refused write
-    if (WRITES.includes(act) && reloading) return report(L2("Моделът се презарежда – опитайте след малко.", "The model is reloading – try again in a moment."), true);
+    const WRITES = ["mark", "undo", "note", "na", "reattachYes", "splitApply", "splitSkip", "mergeApply", "moveLegacy", "backupGo", "lostRetry", "accLostRetry"];
+    // M3: never offer a refused write; a write while another is still in flight is dropped (sweep 18.11.2026: a double
+    // tap on "Готово" re-read the records mid-write and blamed "another user" for the user's own first tap)
+    const gate = U.clickGate(act, { writes: WRITES, canWrite: canWrite(), reloading, inflight });
+    if (gate === "readOnly") return report(readOnlyText(), true);
+    if (gate === "reloading") return report(L2("Моделът се презарежда – опитайте след малко.", "The model is reloading – try again in a moment."), true);
+    if (gate === "busy") return toast(L2("Изчакайте – записът още върви.", "Wait – still saving."), false);
     guarded(() => writing(async () => {
       if (act === "mark" || act === "undo" || act === "note" || act === "na") await applyStep(b.dataset.step, act);
       else if (act === "pourCancel") { state.armPour = null; setStatus(L2("Отказано – нищо не е записано.", "Cancelled – nothing was saved.")); render(); }
+      else if (act === "undoCancel" || act === "naCancel") { state.armUndo = null; state.armNa = null; setStatus(L2("Отказано – нищо не е променено.", "Cancelled – nothing was changed.")); render(); }
+      else if (act === "lostRetry") await retryLost();
+      else if (act === "accLostRetry") await retryAccLost();
       else if (act === "pickPour") await selectPour(state.pours[+b.dataset.i]);
+      else if (act === "pickWhole") { const p = U.partialPour(state.sel); if (p) await selectPour(p.group); }
+      else if (act === "toList") { const h = $("hSummary"); if (h && h.scrollIntoView) h.scrollIntoView({ behavior: "smooth", block: "start" }); }
       else if (act === "reattach") { state.confirmOrphan = state.orphans[+b.dataset.i].guid; render(); }
       else if (act === "reattachNo") { state.confirmOrphan = null; render(); }
       else if (act === "reattachYes") {
@@ -1357,23 +1895,43 @@
   // event that leaves it unchanged (Connect fires them for streaming and visibility too) re-reads no objects and no
   // records: runReload only paints the colours again. A missing versionId never compares equal (U.modelSetKey).
   let lastModelsKey = null;
-  async function start2() {
+  async function start2(opts) {
     lastModelsKey = null;
-    const modelsKey = U.modelSetKey(await loadedModels());
-    const n = state.objects.length || (await loadPours());
+    const specs = await loadedModels();
+    const modelsKey = U.modelSetKey(specs);
+    // The library check needs no pour objects: started now, awaited after the scan (sweep 18.11.2026; it waited for the
+    // whole viewer scan before). Its errors and its setup box come only after the "no pours" check, as before.
+    const setupP = setup(!!(opts && opts.fresh));
+    setupP.catch(() => {});
+    const n = state.objects.length || (await loadPours(specs));
     if (!n) return setStatus(L2("Няма заредени тактове. Отворете модела с тактовете (меню Модели) или изберете етап.", "No pours loaded. Open the model with the pours (Models menu) or pick a stage.")
       + (office() ? L2(" (Нужен е Tekla IFC от Arsten_PourExport, property set Pour/Такт.)", " (Needs a Tekla IFC exported with Arsten_PourExport, property set Pour/Такт.)") : ""), true);
-    if (!(await setup())) { setStatus(""); return; }
+    $("setupBox").hidden = true;
+    const su = await setupP;
+    if (!su.ok) { showSetup(su.html); setStatus(""); return; }
+    if (su.created) setStatus(L2("Полетата за статус са създадени в библиотеката ", "Status fields created in the library ") + state.lib.name);
+    // The photo list needs only state.lib: mounted now, so its read (500-item pages, thousands of photos on a long
+    // project) runs beside the record read (sweep 18.11.2026: it waited for records + acceptance, and on a phone the photo
+    // box said "Зареждане…" for both reads one after the other). The acceptance purposes need only the module, not its data.
+    mountPhotos();
+    // Acceptance needs only state.lib: read side by side with the records, not after the whole colour pass (sweep
+    // 18.11.2026: on a phone the red "армировката не е приета" and the photo box came a colour pass + 2 reads late).
+    const accP = loadAcceptance().then(() => { state.accError = ""; }, (e) => { console.error(e); state.accError = (e && e.message) || String(e); });
     await loadRecords();
     state.ready = true;
     $("mainBox").hidden = false;
     render();
-    if (state.coloured) await applyColours();   // on by default: colour as soon as models and records are loaded (A7)
+    // On by default: colour as soon as models and records are loaded (A7). Not awaited (sweep 18.11.2026): it runs one
+    // pass at a time by itself (applyColours), its errors show through guarded.
+    if (state.coloured) guarded(applyColours);
     const inModel = state.objects.filter((o) => state.records.has(o.guid)).length, outside = state.records.size - inModel;
-    loadProtection();
-    if (state.rebarHidden) { state.rebarIds = null; await setRebarVisible(false); }   // keep "hide rebar" after a model reload
-    try { await loadAcceptance(); state.accError = ""; } catch (e) { console.error(e); state.accError = (e && e.message) || String(e); }
-    mountPhotos();
+    // admins: users, groups, members and the library policy once per open (or after PROTECT_TTL), not on every model /
+    // stage reload (sweep 18.11.2026: each stage switch re-read them beside the record reads); "Провери отново" re-reads
+    if (U.protectDue(state.protectAt, Date.now(), !!(opts && opts.fresh))) loadProtection();
+    await accP;
+    // Keep "hide rebar" after a model reload or a reopen. Not awaited (sweep 18.11.2026): acceptance and photos come
+    // first, the search runs quietly behind them (a first search on a big model takes seconds; later ones are cached).
+    if (state.rebarHidden) { resetRebar(); guarded(() => setRebarVisible(false, true)); }
     // One human sentence for site roles; record counts outside the model and the list fallback only for admins (A8).
     const pl = (k, one, many, en1, enN) => (lang === "bg" ? (I18N ? I18N.plural(k, one, many) : many) : (k === 1 ? en1 : enN));
     setStatus(() => `${state.pours.length} ${pl(state.pours.length, "такт", "такта", "pour", "pours")}, ${n} ${pl(n, "обект", "обекта", "pour object", "pour objects")} · ${inModel} ${lang === "bg" ? "със статус" : "with status"}`
@@ -1427,11 +1985,11 @@
   /** The first load, "Провери отново" and the language switch run start2 under the same guard as a reload (review 10
    *  L1): never two start2 at once, so a reload can't overlap the first load (double read and colour pass) or be
    *  overwritten by it finishing later. A model event during it only queues one reload afterwards. */
-  async function loadGuarded() {
+  async function loadGuarded(opts) {
     if (reloading) { rerun = true; return; }
     if (inflight > 0) { scheduleReload(1000); return; }
     reloading = true;
-    try { await guarded(start2); }
+    try { await guarded(() => start2(opts)); }
     finally {
       reloading = false;
       if (rerun) { rerun = false; scheduleReload(0); }
@@ -1452,7 +2010,7 @@
         return;
       }
       await guarded(async () => {
-        state.objects = []; state.sel = []; state.rebarIds = null;
+        state.objects = []; state.sel = []; resetRebar();
         await start2();
         if (!state.ready) return;
         if (selDuringReload && state.follow) { await selectionFromViewer(true); pendingKeep = null; return; }
@@ -1478,5 +2036,5 @@
   if (I18N) setStatus(I18N.word("connecting", lang));
   TrimbleConnectWorkspace.connect(window.parent, onEvent, 30000)
     .then((api) => start(api))
-    .catch((e) => setStatus((I18N ? I18N.word("connectFail", lang) : "Could not connect to Trimble Connect") + ": " + errText(e), true));
+    .catch((e) => setStatus((I18N ? I18N.word("connectFail", lang) : "Could not connect to Trimble Connect") + " – " + plain(e), true));
 })();

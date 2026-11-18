@@ -472,18 +472,54 @@
 
     /** Replace the whole status of one object, so fields can be cleared (pset-api rejects "" and null for typed
      *  fields, and PATCH cannot remove a field). Same as Connect web: delete, then re-create; if the deleted pset
-     *  still blocks (412), re-create on top of its version. */
+     *  still blocks (412), re-create on top of its version.
+     *  Sweep 18.11.2026: when the re-create fails for any other reason AFTER the delete went through (a timeout, a 429 /
+     *  503 left after the retries, a network drop on site), it is tried once more on top of the deleted version. If that
+     *  fails too, the error carries lost: true, link and props, so the panel can say "the record was deleted - Опитай
+     *  пак" and keep the body for a one-tap rewrite (before, the record was silently gone). */
     async replace(libId, defId, link, props) {
       const path = psetPath(link, libId, defId);
-      try { await this.request("pset", path, "DELETE"); } catch (e) { if (e.status !== 404) throw e; }
+      let deleted = false;
+      try { await this.request("pset", path, "DELETE"); deleted = true; } catch (e) { if (e.status !== 404) throw e; }
       const body = { props: clean(props) };
       try { return await this.request("pset", path, "PATCH", body); }
       catch (e) {
-        if (e.status !== 412 && e.status !== 409) throw e;
-        const del = await this.request("pset", path + "?deleted");
-        return this.request("pset", path, "PATCH", Object.assign(body, { v: del && del.v }));
+        const blocked = e.status === 412 || e.status === 409;
+        if (!blocked && !deleted) throw e;
+        try {
+          const del = await this.request("pset", path + "?deleted");
+          return await this.request("pset", path, "PATCH", Object.assign({}, body, { v: del && del.v }));
+        } catch (e2) {
+          if (!deleted) throw e2;
+          // a re-create answered with a timeout may still have been stored: a live pset with our props is a success
+          try { const cur = await this.request("pset", path); if (cur && !cur.deleted && sameProps(cur.props, body.props)) return cur; } catch {}
+          const err = new ApiError(e2.status || e.status || 0, `${e2.message || e.message} (записът е изтрит и не е създаден отново / the record was deleted and not re-created)`, e2.body);
+          err.lost = true; err.link = link; err.props = body.props; err.cause = e2;
+          throw err;
+        }
       }
     }
+
+    /** readMany with the version of each pset: Map link -> {props, v} (v undefined when the service does not send it).
+     *  Used before a write that must not overwrite another user's change (writeIfUnchanged; sweep 18.11.2026). */
+    async readManyV(libId, defId, links) {
+      const chunks = [];
+      for (let i = 0; i < links.length; i += 100) chunks.push(links.slice(i, i + 100));
+      const all = await mapLimit(chunks, READ_POOL, (chunk) =>
+        this.request("pset", "batch-get", "POST", { psets: chunk.map((link) => ({ link, libId, defId })) }));
+      const out = new Map();
+      for (const res of all) {
+        const got = (res && res.responses && res.responses.psets) || [];
+        for (const p of got) if (p && p.link && !p.deleted) out.set(p.link, { props: p.props || {}, v: p.v });
+      }
+      return out;
+    }
+  }
+
+  /** Same field values (the service may return numbers / booleans as sent; compared as text). */
+  function sameProps(a, b) {
+    const ka = Object.keys(a || {}).sort(), kb = Object.keys(b || {}).sort();
+    return ka.length === kb.length && ka.every((k, i) => k === kb[i] && String(a[k]) === String(b[k]));
   }
 
   /** listAll's map insert: never overwrite a link already listed (see listAll). */

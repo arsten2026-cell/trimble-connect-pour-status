@@ -136,6 +136,7 @@
     const step = STEPS.find((s) => s.id === stepId);
     if (!step) throw new Error("Unknown step " + stepId);
     const r = Object.assign({}, rec || {});
+    const auto = stepId === "formwork" && autoStripped(r);
     const was = !!r[stepId] && !r[`${stepId}_na`];
     r[stepId] = true;
     if (r[`${stepId}_na`]) r[`${stepId}_na`] = false;
@@ -146,6 +147,7 @@
     snapshot(r, info);
     if (info.pour != null) r.pour = info.pour;
     if (info.key != null) r.key = info.key;
+    if (auto) clearAutoStripped(r, info);   // formwork done after all: stripping applies again (sweep 18.11.2026)
     r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`;
     r.log = appendLog(r.log, logLine(`${was ? "corrected" : "done"}: ${step.en} ${r[`${stepId}_date`]} by ${info.by || "?"}${info.note ? " – " + info.note : ""}`, info.now));
     return r;
@@ -157,6 +159,7 @@
     if (!step) throw new Error("Unknown step " + stepId);
     const r = Object.assign({}, rec || {});
     if (!r[stepId]) return r;
+    const auto = stepId === "formwork" && autoStripped(r);
     r[stepId] = false;
     if (r[`${stepId}_na`] != null) r[`${stepId}_na`] = null;
     r[`${stepId}_date`] = null;   // "" is rejected for date fields (422); null clears
@@ -165,7 +168,26 @@
     if (r[`${stepId}_qty`] != null) r[`${stepId}_qty`] = null;
     r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`;
     r.log = appendLog(r.log, logLine(`undone: ${step.en} by ${(info && info.by) || "?"}`, info && info.now));
+    if (auto) { clearAutoStripped(r, info); r.stage = `${stageOf(r).en} / ${stageOf(r).bg}`; }
     return r;
+  }
+
+  /** Stripped was set to "without" by markNa("formwork") (same date and who as the formwork "without"), not by hand.
+   *  Sweep 18.11.2026: a wrong "Не се прави" on formwork that was then undone or marked done left stripped "without",
+   *  so the pour showed as complete (stripped) as soon as it was poured, and its stripping was never recorded. */
+  function autoStripped(rec) {
+    return !!(rec && rec.formwork && rec.formwork_na && rec.stripped && rec.stripped_na
+      && String(rec.stripped_date || "") === String(rec.formwork_date || "") && String(rec.stripped_by || "") === String(rec.formwork_by || ""));
+  }
+  /** Clear the automatic stripped "without" (fields to null: the write then replaces the record) and log it. */
+  function clearAutoStripped(r, info) {
+    r.stripped = false;
+    r.stripped_na = null;
+    r.stripped_date = null;
+    r.stripped_by = null;
+    r.stripped_note = null;
+    if (r.stripped_qty != null) r.stripped_qty = null;
+    r.log = appendLog(r.log, logLine(`undone: Stripping (was "not needed" with the formwork) by ${(info && info.by) || "?"}`, info && info.now));
   }
 
   /**
@@ -306,7 +328,7 @@
     for (const r of rows) {
       const rec = records.get(r.guid) || {};
       const line = [r.pour, r.type, r.volume, r.parts, stageOf(rec)[bg ? "bg" : "en"]];
-      for (const st of STEPS) line.push(isNa(rec, st.id) ? (bg ? "Без" : "Without") : rec[st.id] ? yes : no, rec[st.id] ? rec[`${st.id}_date`] : "", rec[st.id] ? rec[`${st.id}_by`] : "", rec[st.id] ? rec[`${st.id}_note`] : "");
+      for (const st of STEPS) line.push(isNa(rec, st.id) ? (bg ? "Не се прави" : "Not needed") : rec[st.id] ? yes : no, rec[st.id] ? rec[`${st.id}_date`] : "", rec[st.id] ? rec[`${st.id}_by`] : "", rec[st.id] ? rec[`${st.id}_note`] : "");
       line.push(r.guid, rec.log);
       lines.push(line.map(cell).join(";"));
     }
@@ -583,6 +605,6 @@
     return r;
   }
 
-  return { STEPS, NOT_STARTED, REBAR_FIRST, STAGES, SEE_THROUGH, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep,
+  return { STEPS, NOT_STARTED, REBAR_FIRST, STAGES, SEE_THROUGH, DEF_ID, LIB_NAME, LIB_NAMES, STEP_QTY, definition, entityLink, today, stageIndex, stageOf, markStep, undoStep, autoStripped,
     markNa, isNa, setNote, splits, inherit, splitDone, merges, mergeBack, mergedInto, bboxText, clearsField, stepValues, stepState, summary, matchKey, orphans, toCsv, invoiceData };
 });

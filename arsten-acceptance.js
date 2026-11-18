@@ -59,17 +59,52 @@
   const DECISIONS = ["approved", "remarks", "rejected"];
   const REQ_FIELDS = ["step", "pour", "photos", "objects", "requested", "requested_by", "sent", "todo_id", "round", "log"];
   const roundOf = (r) => String((r && r.round) || "1");
+  // ---------- what a decision was given for (sweep 18.11.2026) ----------
+  // The request (pour, step, photos) sits in the "acceptance" definition, which 02 / 02.1 / 00_ADMIN can edit: a request
+  // approved for T1 formwork could be PATCHed to T5 rebar (round left alone) and the approval moved with it - shown as
+  // approved by the designer and published to the client. The decision now names what it was given for: its log line
+  // carries "{for <pour> · <step> · <n> photos #<hash>}", the hash of pour + step + the sorted photo ids. It is kept in
+  // the decision's own log (written only by the 4.1 group) and NOT in new fields: pset-api answers 400 / 422 to a
+  // property the "acceptdecision" definition of a live library does not have yet, and the designer's save has no
+  // fallback - a new field would have stopped every decision until the definition was extended.
+  // merge() counts a decision only when its hash matches the request now; otherwise the request is "open" with
+  // staleDecision set ("changed after the decision"). Old decisions without the tag keep the earlier behaviour.
+  const ids0 = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
+  /** FNV-1a 32 bit, 8 hex digits (not secret: only the 4.1 group writes the log that holds it). */
+  function fnv(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return h.toString(16).padStart(8, "0");
+  }
+  /** The hash of what a request asks to be accepted: pour, step and the set of photo ids (order does not matter). */
+  const basisOf = (r) => fnv([String((r && r.pour) || ""), String((r && r.step) || ""), [...new Set(ids0(r && r.photos))].sort().join(",")].join("|"));
+  const basisTag = (r) => `{for ${String(r.pour || "").replace(/[{}\r\n]/g, " ")} · ${r.step} · ${new Set(ids0(r.photos)).size} photos #${basisOf(r)}}`;
+  /** The basis hash of the LAST decision line of `round` in a decision log, "" when that line has none (old decision). */
+  function basisIn(log, round) {
+    const head = `round ${String(round).replace(/\D/g, "")}: `;
+    const lines = String(log || "").split("\n").filter((l) => l.indexOf(head) >= 0 && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2} round \d+: /.test(l));
+    const last = lines[lines.length - 1] || "";
+    const m = /\{for [^\n]*?#([0-9a-f]{8})\}/.exec(last);
+    return m ? m[1] : "";
+  }
+  /** Shown on a request whose decision no longer matches it (BG / EN). */
+  const CHANGED_NOTE = { bg: "Заявката е променена след решението – чака ново приемане", en: "Changed after the decision – awaiting acceptance again" };
   /**
    * Requests + decisions -> what everyone sees. status/decided/decided_by/comment come ONLY from a decision for the
-   * request's current round; otherwise the request is "open". declog = the decision's own history.
+   * request's current round AND for what the request asks now (pour, step, photos: see basisOf); otherwise the request
+   * is "open" (staleDecision = the decision that no longer matches). declog = the decision's own history.
    * @param requests [{link, ...request props}]  @param decisions Map link -> decision props
    */
   function merge(requests, decisions) {
     return requests.map((q) => {
       const d = decisions && decisions.get(q.link);
-      const counts = !!(d && DECISIONS.includes(d.status) && roundOf(d) === roundOf(q));
+      const forRound = !!(d && DECISIONS.includes(d.status) && roundOf(d) === roundOf(q));
+      const basis = forRound ? basisIn(d.log, roundOf(d)) : "";
+      const stale = forRound && !!basis && basis !== basisOf(q);
+      const counts = forRound && !stale;
       return Object.assign({}, q, { round: roundOf(q), status: counts ? d.status : "open", decided: counts ? d.decided || "" : "",
-        decided_by: counts ? d.decided_by || "" : "", comment: counts ? d.comment || "" : "", declog: (d && d.log) || "" });
+        decided_by: counts ? d.decided_by || "" : "", comment: counts ? d.comment || "" : "", declog: (d && d.log) || "",
+        staleDecision: stale ? d.status : "" });
     });
   }
   /** The request record to save (request fields only; its status is always "open"). */
@@ -128,14 +163,16 @@
   /** Open requests not yet sent to the designer. */
   const toSend = (records) => records.filter((r) => valid(r) && r.status === "open" && !r.sent);
 
-  /** ONE ToDo for all of them, assigned to the approver group. */
+  /** ONE ToDo for all of them, assigned to the approver group. Security sweep 18.11.2026: a Connect ToDo may be listed
+   *  for every project member, the client (01.CLIENT) included, so it carries only the count and the pours / steps -
+   *  never who asked, when, or any comment (those stay in the pset records, which the client cannot read). */
   function todoBody(requests, p) {
     const bg = p.lang !== "en", n = requests.length;
     const lines = requests.slice().sort((a, b) => (a.pour + a.step < b.pour + b.step ? -1 : 1))
-      .map((r) => `• ${r.pour} – ${STEPS[r.step][bg ? "bg" : "en"]} (${ids(r.photos).length} ${bg ? "снимки" : "photos"}, ${r.requested_by || "?"} ${r.requested || ""})`);
+      .map((r) => `• ${r.pour} – ${STEPS[r.step][bg ? "bg" : "en"]}`);
     return {
       title: bg ? `За приемане: ${n} ${n === 1 ? "заявка" : "заявки"} (${stamp(p.now || new Date()).slice(0, 10)})` : `For acceptance: ${n} request${n === 1 ? "" : "s"} (${stamp(p.now || new Date()).slice(0, 10)})`,
-      description: (bg ? "Моля, прегледайте и приемете в панела „Приемане“ в 3D изгледа на Trimble Connect:\n" : "Please review and decide in the \"Acceptance\" panel of the Trimble Connect 3D viewer:\n") + lines.join("\n"),
+      description: (bg ? `${n} ${n === 1 ? "заявка" : "заявки"} за приемане – отворете Авторски надзор:\n` : `${n} request${n === 1 ? "" : "s"} for acceptance – open Design supervision:\n`) + lines.join("\n"),
       type: "Request", priority: "NORMAL", status: "NEW", projectId: p.projectId,
       assignees: p.groupId ? [{ id: p.groupId, type: "GROUP" }] : [],
     };
@@ -151,7 +188,7 @@
     if ((d.decision === "remarks" || d.decision === "rejected") && !comment) throw Object.assign(new Error("comment required"), { code: "comment" });
     const now = d.now || new Date();
     return { status: d.decision, round: roundOf(r), decided: stamp(now), decided_by: d.by || "", comment,
-      log: addLog(r.declog, `${stamp(now)} round ${roundOf(r)}: ${d.decision} by ${d.by || "?"}${comment ? " – " + comment : ""}`) };
+      log: addLog(r.declog, `${stamp(now)} round ${roundOf(r)}: ${d.decision} by ${d.by || "?"} ${basisTag(r)}${comment ? " – " + comment.replace(/\s*\n+\s*/g, " ") : ""}`) };
   }
 
   /**
@@ -164,10 +201,11 @@
     if (!todoId) return null;
     const mine = records.filter((r) => valid(r) && r.todo_id === todoId);
     if (!mine.length || mine.some((r) => !DECISIONS.includes(r.status))) return null;
-    const bg = lang !== "en";
-    const lines = mine.slice().sort((a, b) => (a.pour + a.step < b.pour + b.step ? -1 : 1))
-      .map((r) => `• ${r.pour} – ${STEPS[r.step][bg ? "bg" : "en"]}: ${STATUS[r.status][bg ? "bg" : "en"]}${r.decided_by ? " (" + r.decided_by + (r.decided ? ", " + r.decided : "") + ")" : ""}${r.comment ? " – „" + r.comment + "“" : ""}`);
-    return { todoId, comment: (bg ? "Всички заявки са решени в панела „Приемане“:\n" : "All requests are decided in the \"Acceptance\" panel:\n") + lines.join("\n") };
+    // security sweep 18.11.2026: counts only - who decided, when, and the rejection / remarks text stay in the pset
+    // records (the client may be able to read Connect ToDos, see todoBody)
+    const bg = lang !== "en", c = (st) => mine.filter((r) => r.status === st).length;
+    return { todoId, comment: bg ? `Решено: ${c("approved")} одобрени, ${c("remarks")} със забележки, ${c("rejected")} отхвърлени – виж панела Авторски надзор.`
+      : `Decided: ${c("approved")} approved, ${c("remarks")} with remarks, ${c("rejected")} rejected – see the Design supervision panel.` };
   }
 
   /** Latest request of a pour and step (or null). */
@@ -209,5 +247,5 @@
     return [...new Set(pours)].filter((p) => { const r = latestCovering(records, p, "rebar"); return !r || !(r.status === "approved" || r.status === "remarks"); });
   }
 
-  return { DEF_ID, DEC_ID, STEPS, STATUS, APPROVER_GROUP, full, valid, merge, reqProps, decisionDefinition, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, todoOutcome, latest, latestCovering, pourStates, rebarNotApproved, parseObjects, ids };
+  return { DEF_ID, DEC_ID, STEPS, STATUS, CHANGED_NOTE, APPROVER_GROUP, basisOf, basisIn, full, valid, merge, reqProps, decisionDefinition, definition, prefix, link, attachPhotos, toSend, todoBody, markSent, decide, todoOutcome, latest, latestCovering, pourStates, rebarNotApproved, parseObjects, ids };
 });

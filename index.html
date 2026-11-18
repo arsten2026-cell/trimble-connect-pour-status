@@ -80,6 +80,10 @@
   .accwarn.armed { border-color:var(--bad); background:#fdecea; }
   .accwarn.armed div { margin-top:3px; font-weight:600; }
   button.armed { background:var(--bad); border-color:var(--bad); }
+  /* sweep 18.11.2026: part of a pour selected ("1 от 15 обекта на TAKT 1 · Избери целия такт"); nothing selected = one
+     line + a jump to the pours list instead of four disabled step cards */
+  .partpour { display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; margin-top:5px; padding:5px 7px; font-size:12px; background:#fff4e5; border:1px solid #f0c48a; }
+  .pickfirst { display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; padding:8px; background:var(--panel); border:1px solid var(--line); font-size:13px; }
   /* search above the pours table (A5) */
   .search input[type=search] { flex:1 1 160px; min-width:0; }
   /* result of a write, at the bottom near the finger (A2) */
@@ -129,6 +133,15 @@
     </div>
   </div>
 
+  <!-- sweep 18.11.2026: the steps (the most common site task) come right after the selection, the acceptance box under
+       them ("Излят" depends on it), then photos, then the view settings - no scrolling past two tall boxes on a phone -->
+  <h2 id="hSteps">Steps</h2>
+  <div id="steps" class="steps"></div>
+  <div id="accBox"></div>
+
+  <h2 id="hPhotos">Снимки</h2>
+  <div id="photosBox"></div>
+
   <h2 id="hView">View</h2>
   <div id="viewBox" class="box viewbox">
     <label class="switch main"><input type="checkbox" role="switch" id="chkColour"><span class="sl" aria-hidden="true"></span><span id="lblColour">Colour by status</span></label>
@@ -139,13 +152,6 @@
       <label class="switch"><input type="checkbox" role="switch" id="chkHideRebar"><span class="sl" aria-hidden="true"></span><span id="lblHideRebar">Hide rebar</span></label>
     </div>
   </div>
-
-  <h2 id="hPhotos">Снимки</h2>
-  <div id="photosBox"></div>
-  <div id="accBox"></div>
-
-  <h2 id="hSteps">Steps</h2>
-  <div id="steps" class="steps"></div>
 
   <div class="hrow"><h2 id="hSummary">Pours</h2><button id="btnCsv" class="small secondary">Export Excel</button></div>
   <div class="bar search"><input type="search" id="pourSearch" autocomplete="off" enterkeyhint="search"><button id="btnPickMatches" class="small secondary" disabled>Select in the model</button></div>
@@ -166,9 +172,9 @@
   </div>
 
   <div id="protectBox" hidden>
-    <h2>Права в библиотеката (admin)</h2>
+    <h2 id="hProtect">Права в библиотеката</h2>
     <div class="box"><div id="protectText" class="sub"></div></div>
-    <h2>Роли в проекта (admin)</h2>
+    <h2 id="hRoles">Роли в проекта</h2>
     <div class="box sub" id="rolesList"></div>
   </div>
 
@@ -184,15 +190,15 @@
 <script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js" integrity="sha384-lFiNt/56q6HnUNbuy0WHO3NP6BkQjY4EH8+5eELYVfnhkB42snRTmSa3UOAlX9gg" crossorigin="anonymous"></script>
 <script src="arsten-perf.js?v=21f7454938"></script>
 <script src="arsten-diag.js?v=bb0c6351fe"></script>
-<script src="arsten-i18n.js?v=de006467e2"></script>
-<script src="arsten-access.js?v=253829d007"></script>
+<script src="arsten-i18n.js?v=c58f01c9fc"></script>
+<script src="arsten-access.js?v=fad565fcbe"></script>
 <script src="common.js?v=a04c428e31"></script>
-<script src="status.js?v=900f56b5c0"></script>
+<script src="status.js?v=5dfad10961"></script>
 <script src="arsten-links.js?v=7bf607a606"></script>
-<script src="psetapi.js?v=f5bc3d57fb"></script>
-<script src="arsten-photos.js?v=fd69e17caf"></script>
-<script src="arsten-acceptance.js?v=3fb82d4a41"></script>
-<script src="arsten-backup.js?v=032cc821bb"></script>
-<script src="app.js?v=53afb44af4"></script>
+<script src="psetapi.js?v=970df94af2"></script>
+<script src="arsten-photos.js?v=58db357146"></script>
+<script src="arsten-acceptance.js?v=f8e113bc4d"></script>
+<script src="arsten-backup.js?v=6c54dfe763"></script>
+<script src="app.js?v=b4079cfccf"></script>
 </body>
 </html>
