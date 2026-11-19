@@ -45,7 +45,8 @@
       description: cur.description != null ? cur.description : def.description,
       schema: Object.assign({}, cur.schema, { props }),
       i18n: mergeI18n(cur.i18n, def.i18n, missing),
-      v: cur.v,
+      // no "v": live 19.11.2026 (1028) the service answers 422 "Property 'v' has not been defined" to it, so a definition
+      // that missed a field was never extended and every load logged the error
     };
   }
 
