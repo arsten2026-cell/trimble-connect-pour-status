@@ -457,12 +457,19 @@
       return p ? { props: null, v: p.v } : null;
     }
 
-    /** Merge-write (PATCH) carrying the version read with readOne, so a write made by someone else in between
-     *  is refused (412/409) instead of overwritten. v undefined: plain create / merge. */
-    writeIfUnchanged(libId, defId, link, props, v) {
-      const body = { props: clean(props) };
-      if (v !== undefined && v !== null) body.v = v;
-      return this.request("pset", psetPath(link, libId, defId), "PATCH", body);
+    /** Merge-write (PATCH) that refuses (412) when the pset is no longer at version v (read with readOne), so a write
+     *  made by someone else in between is not overwritten. v undefined: plain create / merge.
+     *  Live 19.11.2026 (1028, Монолитен бетон): the pset service answers 422 "Property 'v' has not been defined and the
+     *  schema does not allow additional properties" to a PATCH body with v - although its OpenAPI lists v - so every
+     *  write on an existing record failed. The version is now checked by reading it right before the PATCH (one more
+     *  GET; the window left is that one round trip) and the body carries only props. */
+    async writeIfUnchanged(libId, defId, link, props, v) {
+      const path = psetPath(link, libId, defId), body = { props: clean(props) };
+      if (v !== undefined && v !== null) {
+        const now = await this.readOne(libId, defId, link);
+        if (!now || now.v !== v) throw new ApiError(412, `pset changed meanwhile (version ${now ? now.v : "none"}, expected ${v})`);
+      }
+      return this.request("pset", path, "PATCH", body);
     }
 
     /** Delete one pset; no error when it does not exist (404) or is already deleted (410). */
@@ -487,8 +494,8 @@
         const blocked = e.status === 412 || e.status === 409;
         if (!blocked && !deleted) throw e;
         try {
-          const del = await this.request("pset", path + "?deleted");
-          return await this.request("pset", path, "PATCH", Object.assign({}, body, { v: del && del.v }));
+          // the re-create once more (the service refuses a v in the body, live 19.11.2026: no version is sent)
+          return await this.request("pset", path, "PATCH", body);
         } catch (e2) {
           if (!deleted) throw e2;
           // a re-create answered with a timeout may still have been stored: a live pset with our props is a success
